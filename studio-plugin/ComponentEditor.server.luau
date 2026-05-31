@@ -1,9 +1,16 @@
 -- Component Editor Studio plugin.
 --
--- Reads component definitions from ReplicatedStorage.Plugins.Components.Definitions
--- (synced there by the roblox-csharp compile step) and shows an inspector
--- for the currently-selected Instance: list of attached components, the
+-- Walks the DataModel's compiler-emitted containers (ReplicatedStorage,
+-- ServerScriptService, StarterPlayer.StarterPlayerScripts) for every
+-- ModuleScript whose returned table has a `ComponentName` field — the
+-- shape `Component.define(name)` produces. Shows an inspector for the
+-- currently-selected Instance: list of attached components, the
 -- ability to add/remove them, and a typed editor for each SerializedField.
+--
+-- Earlier versions read from a fixed `Plugins.Components.Definitions`
+-- subtree, but the runtime refactor that made ComponentsService DI-driven
+-- removed that subtree. Definitions now live wherever the user's source
+-- lowered them to, so we scan for them by shape instead of by path.
 --
 -- Visually styled to match Studio's native Properties panel — same dark
 -- chrome, same section-header look, same row layout. Colors come from
@@ -25,7 +32,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
 local TAG_PREFIX = "Component:"
-local DEFINITIONS_PATH = { "Plugins", "Components", "Definitions" }
 
 ----------------------------------------------------------------------
 -- Module-level state
@@ -69,28 +75,52 @@ end
 -- Definitions discovery
 ----------------------------------------------------------------------
 
--- Walks ReplicatedStorage by the configured path. Returns nil if the
--- runtime hasn't been synced yet so the inspector can show a helpful
--- "compile your project first" hint instead of silently failing.
-local function findDefinitionsFolder()
-	local node = ReplicatedStorage
-	for _, segment in ipairs(DEFINITIONS_PATH) do
-		if not node then return nil end
-		node = node:FindFirstChild(segment)
-	end
-	return node
+-- The three containers the compiler routes Rojo context mounts into:
+-- src/shared → ReplicatedStorage, src/server → ServerScriptService,
+-- src/client → StarterPlayer.StarterPlayerScripts. A user's `: Component`
+-- class lowers to a ModuleScript in whichever of these contexts its
+-- source file lived under, so scanning all three covers every possible
+-- definition site without descending into Workspace (where user-placed
+-- ModuleScripts could produce false positives).
+local function discoveryRoots()
+	local roots = { ReplicatedStorage, game:GetService("ServerScriptService") }
+	local starterPlayer = game:FindFirstChild("StarterPlayer")
+	local starterScripts = starterPlayer and starterPlayer:FindFirstChild("StarterPlayerScripts")
+	if starterScripts then table.insert(roots, starterScripts) end
+	return roots
+end
+
+-- Component.define(name) returns a table with a string `ComponentName`
+-- field — that's the only shape signal we need. pcall guards against
+-- require errors (cyclic deps, runtime-only side effects firing in
+-- Edit mode, ...) so a single broken module can't take down the
+-- whole inspector.
+--
+-- Source pre-filter: we read each ModuleScript.Source and only
+-- require modules that actually mention `Component.define` or
+-- `ComponentName`. Without the filter, every refresh would require
+-- every ModuleScript in ReplicatedStorage / ServerScriptService /
+-- StarterPlayerScripts — including unrelated files whose top-level
+-- side effects (network preludes creating RemoteEvents in Edit mode,
+-- DataStore warmups, ...) would leave persistent garbage in the
+-- place file.
+local function looksLikeComponentSource(moduleScript)
+	local ok, source = pcall(function() return moduleScript.Source end)
+	if not ok or type(source) ~= "string" then return false end
+	return string.find(source, "Component.define", 1, true) ~= nil
+		or string.find(source, "ComponentName", 1, true) ~= nil
 end
 
 local function loadDefinitions()
-	local folder = findDefinitionsFolder()
-	if not folder then return nil end
-
 	local defs = {}
-	for _, child in ipairs(folder:GetChildren()) do
-		if child:IsA("ModuleScript") then
-			local ok, mod = pcall(require, child)
-			if ok and type(mod) == "table" and mod.ComponentName then
-				defs[mod.ComponentName] = mod
+	for _, root in ipairs(discoveryRoots()) do
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if descendant:IsA("ModuleScript") and looksLikeComponentSource(descendant) then
+				local ok, mod = pcall(require, descendant)
+				if ok and type(mod) == "table"
+					and type(mod.ComponentName) == "string" then
+					defs[mod.ComponentName] = mod
+				end
 			end
 		end
 	end
@@ -658,31 +688,33 @@ local function build()
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = scroll
 
-	-- Definitions check first.
+	-- Definitions check first. loadDefinitions always returns a table;
+	-- emptiness signals the project doesn't have any `: Component`
+	-- subclasses yet (or none have made it through compile + sync).
 	local defs = loadDefinitions()
-	if not defs then
+	if not next(defs) then
 		local block = makeFrame({
 			parent = scroll,
 			color = color("MainBackground"),
-			size = UDim2.new(1, 0, 0, 80),
+			size = UDim2.new(1, 0, 0, 62),
 		})
 		makePadding(block, 12, 12, 12, 0)
 		makeLabel({
 			parent = block,
-			text = "Components runtime not found.",
-			color = color("ErrorText"),
+			text = "No components defined.",
+			color = color("DimmedText"),
 			frameSize = UDim2.new(1, 0, 0, 22),
 		})
 		makeLabel({
 			parent = block,
-			text = "Compile your project with `roblox-csharp` so the",
+			text = "Declare a `: Component` class in your sources",
 			color = color("DimmedText"),
 			frameSize = UDim2.new(1, 0, 0, 18),
 			position = UDim2.new(0, 0, 0, 26),
 		})
 		makeLabel({
 			parent = block,
-			text = "Components plugin syncs to ReplicatedStorage.",
+			text = "and compile with `roblox-csharp`.",
 			color = color("DimmedText"),
 			frameSize = UDim2.new(1, 0, 0, 18),
 			position = UDim2.new(0, 0, 0, 44),
