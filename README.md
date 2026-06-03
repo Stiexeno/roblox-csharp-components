@@ -118,7 +118,7 @@ Supported types in v1: `int`, `long`, `float`, `double`, `string`, `bool`.
 
 4. `ComponentsService` (this plugin's runtime) holds the container, wires `CollectionService` watchers per registered type, resolves each component's `__ctorParams` via the container at spawn time, and drives the `Update` / `LateUpdate` ticks.
 
-The compiler-side hook is hardcoded in `roblox-csharp` for now (`ComponentLowering.cs` + the `CollectComponentClasses` walker in `CompilationUnitTransformer`). It's intended as the reference implementation for a future "transformer plugin" extension API — at which point this plugin extracts that logic too.
+The compiler-side hook lives in this plugin's `extension/` folder — `ComponentsExtension.cs` (the `IRobloxCSharpExtension` entry point) and `ComponentLowering.cs` (the `Component` subclass detection + `Component.define` lowering). `roblox-csharp`'s `PluginExtensionLoader` compiles those source files in-memory at install time against the transpiler's loaded assemblies, so this plugin owns its transpiler hook end-to-end — no special-casing inside the main compiler.
 
 ## Roadmap
 

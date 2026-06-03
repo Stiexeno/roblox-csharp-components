@@ -12,7 +12,13 @@ using RobloxCSharp.Transformer.Factory;
 
 namespace RobloxCSharp.Extensions.Components
 {
-
+	/// <summary>
+	/// Transpiler hook that detects every <see cref="Components.Component"/>
+	/// subclass at compile time and appends an auto-registration tail to the
+	/// project's <c>Installer</c> boot script — one
+	/// <c>ComponentsService:Register(T)</c> call per discovered subclass — so
+	/// user code never has to register components by hand.
+	/// </summary>
 	public sealed class ComponentsExtension : IRobloxCSharpExtension
 	{
 

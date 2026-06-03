@@ -9,7 +9,13 @@ using RobloxCSharp.Transformer.Factory;
 
 namespace RobloxCSharp.Extensions.Components
 {
-
+	/// <summary>
+	/// Helpers for the Components-aware lowering passes inside
+	/// <see cref="ComponentsExtension"/>. Identifies <see cref="Components.Component"/>
+	/// subclasses by base-type symbol and emits the
+	/// <c>Component.define(name)</c> scaffold the runtime expects in place of
+	/// the regular Luau class metatable.
+	/// </summary>
 	public static class ComponentLowering
 	{
 
