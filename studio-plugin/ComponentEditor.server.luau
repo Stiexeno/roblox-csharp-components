@@ -32,6 +32,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
 
 local TAG_PREFIX = "Component:"
 
@@ -216,6 +217,26 @@ local function roundCorners(parent, radius)
 	return corner
 end
 
+-- Wraps a mutation so it lands on Studio's undo stack. TryBeginRecording
+-- returns a session identifier or nil if another recording is in flight;
+-- in the nil case we still run the mutation so the edit isn't lost — it
+-- just won't be undoable. Errors inside `fn` cancel the recording instead
+-- of committing a half-applied change.
+local function recordChange(name, fn)
+	local id = ChangeHistoryService:TryBeginRecording(name)
+	if not id then
+		fn()
+		return
+	end
+	local ok, err = pcall(fn)
+	if ok then
+		ChangeHistoryService:FinishRecording(id, Enum.FinishRecordingOperation.Commit)
+	else
+		ChangeHistoryService:FinishRecording(id, Enum.FinishRecordingOperation.Cancel)
+		warn("[Components] " .. name .. " errored: " .. tostring(err))
+	end
+end
+
 local function buildFieldRow(parent, fieldName, _rowIndex, depth)
 	depth = depth or 0
 	local labelX = 14 + depth * 14
@@ -283,7 +304,9 @@ local function createNumberEditor(parent, fieldName, instance, attrName, rowInde
 	box.FocusLost:Connect(function()
 		local n = tonumber(box.Text)
 		if n then
-			instance:SetAttribute(attrName, n)
+			recordChange("Set " .. fieldName, function()
+				instance:SetAttribute(attrName, n)
+			end)
 		else
 			-- User typed garbage; snap back to the real value.
 			box.Text = tostring(instance:GetAttribute(attrName) or 0)
@@ -303,7 +326,9 @@ local function createStringEditor(parent, fieldName, instance, attrName, rowInde
 	local box = makeValueTextBox(slot, tostring(instance:GetAttribute(attrName) or ""))
 
 	box.FocusLost:Connect(function()
-		instance:SetAttribute(attrName, box.Text)
+		recordChange("Set " .. fieldName, function()
+			instance:SetAttribute(attrName, box.Text)
+		end)
 	end)
 	local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
 		if not box:IsFocused() then
@@ -335,7 +360,9 @@ local function createBooleanEditor(parent, fieldName, instance, attrName, rowInd
 	refresh()
 
 	toggle.MouseButton1Click:Connect(function()
-		instance:SetAttribute(attrName, not instance:GetAttribute(attrName))
+		recordChange("Toggle " .. fieldName, function()
+			instance:SetAttribute(attrName, not instance:GetAttribute(attrName))
+		end)
 	end)
 	local conn = instance:GetAttributeChangedSignal(attrName):Connect(refresh)
 	return function() conn:Disconnect() end
@@ -451,7 +478,9 @@ local function createInstanceEditor(parent, fieldName, instance, attrName, rowIn
 
 	clear.MouseButton1Click:Connect(function()
 		disarmPicker()
-		instance:SetAttribute(attrName, "")
+		recordChange("Clear " .. fieldName, function()
+			instance:SetAttribute(attrName, "")
+		end)
 	end)
 
 	local conn = instance:GetAttributeChangedSignal(attrName):Connect(paintDisplay)
@@ -736,7 +765,9 @@ local function createEnumEditor(parent, fieldName, instance, attrName, rowIndex,
 					row.MouseLeave:Connect(function() row.BackgroundTransparency = 1 end)
 
 					row.MouseButton1Click:Connect(function()
-						instance:SetAttribute(attrName, item.value)
+						recordChange("Set " .. fieldName .. " = " .. item.name, function()
+							instance:SetAttribute(attrName, item.value)
+						end)
 						closeDropdown()
 					end)
 				end
@@ -782,6 +813,38 @@ local function initElementDefaults(instance, prefix, elementDef)
 		end
 	else
 		instance:SetAttribute(prefix, elementDef.default)
+	end
+end
+
+local function initFieldDefaults(instance, prefix, fieldDef)
+	if fieldDef.type == "composite" then
+		for childName, childDef in pairs(fieldDef.fields) do
+			initFieldDefaults(instance, prefix .. "_" .. childName, childDef)
+		end
+	elseif fieldDef.type == "list" then
+		instance:SetAttribute(prefix .. "_Count", 0)
+	else
+		instance:SetAttribute(prefix, fieldDef.default)
+	end
+end
+
+-- Recursively unsets every attribute that backs a serialized field —
+-- including composite leaves (any depth) and list elements (1..Count).
+-- Used when a component is removed so no orphan attributes linger to
+-- pollute a future re-add.
+local function clearFieldAttributes(instance, prefix, fieldDef)
+	if fieldDef.type == "composite" then
+		for childName, childDef in pairs(fieldDef.fields) do
+			clearFieldAttributes(instance, prefix .. "_" .. childName, childDef)
+		end
+	elseif fieldDef.type == "list" then
+		local count = instance:GetAttribute(prefix .. "_Count") or 0
+		for i = 1, count do
+			clearFieldAttributes(instance, prefix .. "_" .. i, fieldDef.element)
+		end
+		instance:SetAttribute(prefix .. "_Count", nil)
+	else
+		instance:SetAttribute(prefix, nil)
 	end
 end
 
@@ -842,9 +905,11 @@ local function createListEditor(parent, fieldName, instance, attrName, _rowIndex
 	roundCorners(addBtn, 4)
 
 	addBtn.MouseButton1Click:Connect(function()
-		local newCount = count + 1
-		initElementDefaults(instance, attrName .. "_" .. newCount, elementDef)
-		instance:SetAttribute(attrName .. "_Count", newCount)
+		recordChange("Add to " .. fieldName, function()
+			local newCount = count + 1
+			initElementDefaults(instance, attrName .. "_" .. newCount, elementDef)
+			instance:SetAttribute(attrName .. "_Count", newCount)
+		end)
 		refresh()
 	end)
 
@@ -899,18 +964,20 @@ local function createListEditor(parent, fieldName, instance, attrName, _rowIndex
 
 		local idx = i
 		removeBtn.MouseButton1Click:Connect(function()
-			local last = count
-			for j = idx, last - 1 do
+			recordChange("Remove from " .. fieldName, function()
+				local last = count
+				for j = idx, last - 1 do
+					forEachLeafRelPath(elementDef, "", function(relPath)
+						local from = attrName .. "_" .. (j + 1) .. relPath
+						local to = attrName .. "_" .. j .. relPath
+						instance:SetAttribute(to, instance:GetAttribute(from))
+					end)
+				end
 				forEachLeafRelPath(elementDef, "", function(relPath)
-					local from = attrName .. "_" .. (j + 1) .. relPath
-					local to = attrName .. "_" .. j .. relPath
-					instance:SetAttribute(to, instance:GetAttribute(from))
+					instance:SetAttribute(attrName .. "_" .. last .. relPath, nil)
 				end)
-			end
-			forEachLeafRelPath(elementDef, "", function(relPath)
-				instance:SetAttribute(attrName .. "_" .. last .. relPath, nil)
+				instance:SetAttribute(attrName .. "_Count", last - 1)
 			end)
-			instance:SetAttribute(attrName .. "_Count", last - 1)
 			refresh()
 		end)
 	end
@@ -999,10 +1066,12 @@ local function buildComponentSection(parent, instance, componentName, def, clean
 	roundCorners(remove, 4)
 
 	remove.MouseButton1Click:Connect(function()
-		CollectionService:RemoveTag(instance, TAG_PREFIX .. componentName)
-		for fieldName in pairs(def.SerializedFields or {}) do
-			instance:SetAttribute(componentName .. "_" .. fieldName, nil)
-		end
+		recordChange("Remove " .. componentName, function()
+			CollectionService:RemoveTag(instance, TAG_PREFIX .. componentName)
+			for fieldName, fieldDef in pairs(def.SerializedFields or {}) do
+				clearFieldAttributes(instance, componentName .. "_" .. fieldName, fieldDef)
+			end
+		end)
 		refresh()
 	end)
 
@@ -1206,14 +1275,13 @@ local function openPicker(host, instance, defs, attached)
 			pad.Parent = row
 
 			row.MouseButton1Click:Connect(function()
-				CollectionService:AddTag(instance, TAG_PREFIX .. name)
-				local def = defs[name]
-				for fieldName, fieldDef in pairs(def.SerializedFields or {}) do
-					local attrName = name .. "_" .. fieldName
-					if instance:GetAttribute(attrName) == nil then
-						instance:SetAttribute(attrName, fieldDef.default)
+				recordChange("Add " .. name, function()
+					CollectionService:AddTag(instance, TAG_PREFIX .. name)
+					local def = defs[name]
+					for fieldName, fieldDef in pairs(def.SerializedFields or {}) do
+						initFieldDefaults(instance, name .. "_" .. fieldName, fieldDef)
 					end
-				end
+				end)
 				closePicker()
 				refresh()
 			end)
@@ -1471,8 +1539,10 @@ Selection.SelectionChanged:Connect(function()
 		local picked = Selection:Get()[1]
 		local p = armedPicker
 		if picked and picked ~= p.ownerInstance and picked:IsA(p.constraint) then
-			local uid = bindUid(picked)
-			p.ownerInstance:SetAttribute(p.attrName, uid)
+			recordChange("Pick " .. picked.Name, function()
+				local uid = bindUid(picked)
+				p.ownerInstance:SetAttribute(p.attrName, uid)
+			end)
 			disarmPicker()
 			Selection:Set({ p.ownerInstance })
 			return
