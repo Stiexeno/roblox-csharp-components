@@ -15,4 +15,5 @@
 return {
 	Component = require(script.Component),
 	ComponentsService = require(script.ComponentsService),
+	InstanceRegistry = require(script.InstanceRegistry),
 }

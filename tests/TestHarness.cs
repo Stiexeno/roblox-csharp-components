@@ -17,6 +17,8 @@ using System;
 namespace RobloxCSharp.RobloxApi
 {
 	public class Instance { }
+	public class BasePart : Instance { }
+	public class Part : BasePart { }
 }
 
 namespace Components
@@ -70,13 +72,15 @@ public class ClientAttribute : Attribute { }
 			ext.OnCompile(compilation, Array.Empty<Plugin>(), new DiagnosticBag());
 		}
 
-		public static T FirstNode<T>(CompilationUnitSyntax root) where T : SyntaxNode
+		public static T FirstNode<T>(CompilationUnitSyntax root, string name = null) where T : SyntaxNode
 		{
 			foreach (SyntaxNode node in root.DescendantNodes())
 			{
-				if (node is T t) return t;
+				if (node is not T t) continue;
+				if (name is not null && t is TypeDeclarationSyntax type && type.Identifier.ValueText != name) continue;
+				return t;
 			}
-			throw new InvalidOperationException($"No {typeof(T).Name} found.");
+			throw new InvalidOperationException($"No {typeof(T).Name}{(name is null ? "" : $" named {name}")} found.");
 		}
 	}
 }

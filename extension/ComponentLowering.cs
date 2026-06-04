@@ -178,21 +178,44 @@ namespace RobloxCSharp.Extensions.Components
 			TypeSyntax typeSyntax,
 			ExpressionSyntax initializer)
 		{
-			string luaType = MapToLuaType(state, typeSyntax, memberName);
-
-			LuaExpression defaultExpr = initializer is null
-				? LuaFactory.LiteralExpression(null)
-				: state.Transform(initializer) as LuaExpression;
-
+			ITypeSymbol type = state.SemanticModel.GetTypeInfo(typeSyntax).Type;
 			LuaTableExpression inner = LuaFactory.Table(inline: true);
-			inner.Elements.Add(LuaFactory.Assignment(
-				SyntaxKind.SimpleAssignmentExpression,
-				LuaFactory.Identifier("type"),
-				LuaFactory.LiteralExpression(luaType)));
-			inner.Elements.Add(LuaFactory.Assignment(
-				SyntaxKind.SimpleAssignmentExpression,
-				LuaFactory.Identifier("default"),
-				defaultExpr));
+
+			if (CompositeLowering.TryGetInstanceConstraint(type, out string constraint))
+			{
+				AddKV(inner, "type", LuaFactory.LiteralExpression("instance"));
+				AddKV(inner, "constraint", LuaFactory.LiteralExpression(constraint));
+				AddKV(inner, "default", LuaFactory.LiteralExpression(""));
+			}
+			else if (CompositeLowering.TryGetEnumValues(type, out string enumName,
+				out List<(string, int)> enumValues))
+			{
+				CompositeLowering.EmitEnumEntry(state, enumName, enumValues, initializer, inner);
+			}
+			else if (CompositeLowering.IsCompositeCandidate(type))
+			{
+				LuaTableExpression nested = LuaFactory.Table(inline: false);
+				CompositeLowering.PopulateFields(
+					state, type,
+					new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default),
+					memberName, nested);
+				AddKV(inner, "type", LuaFactory.LiteralExpression("composite"));
+				AddKV(inner, "fields", nested);
+			}
+			else if (CompositeLowering.TryMapPrimitive(type, out string luaType))
+			{
+				LuaExpression defaultExpr = initializer is null
+					? CompositeLowering.DefaultForPrimitive(luaType)
+					: state.Transform(initializer) as LuaExpression;
+				AddKV(inner, "type", LuaFactory.LiteralExpression(luaType));
+				AddKV(inner, "default", defaultExpr);
+			}
+			else
+			{
+				throw new InvalidOperationException(
+					$"[SerializedField] '{memberName}' has unsupported type '{typeSyntax}'. " +
+					"Supported: int / long / float / double / string / bool, Instance subclass, or a plain class of those.");
+			}
 
 			outer.Elements.Add(LuaFactory.ExpressionStatement(
 				LuaFactory.Assignment(
@@ -201,24 +224,12 @@ namespace RobloxCSharp.Extensions.Components
 					inner)));
 		}
 
-		private static string MapToLuaType(TransformerState state, TypeSyntax typeSyntax, string memberName)
+		private static void AddKV(LuaTableExpression t, string key, LuaExpression value)
 		{
-			ITypeSymbol type = state.SemanticModel.GetTypeInfo(typeSyntax).Type;
-			switch (type?.SpecialType)
-			{
-				case SpecialType.System_Int32:
-				case SpecialType.System_Int64:
-				case SpecialType.System_Single:
-				case SpecialType.System_Double:
-					return "number";
-				case SpecialType.System_String:
-					return "string";
-				case SpecialType.System_Boolean:
-					return "boolean";
-			}
-			throw new InvalidOperationException(
-				$"[SerializedField] '{memberName}' has unsupported type '{typeSyntax}'. " +
-				"v1 only supports int / long / float / double / string / bool.");
+			t.Elements.Add(LuaFactory.Assignment(
+				SyntaxKind.SimpleAssignmentExpression,
+				LuaFactory.Identifier(key),
+				value));
 		}
 
 		private static bool HasSerializedFieldAttribute(SyntaxList<AttributeListSyntax> attributeLists)

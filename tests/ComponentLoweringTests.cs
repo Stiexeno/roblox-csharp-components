@@ -101,5 +101,206 @@ public class Health : Component
 			Assert.Contains("SerializedField", ex.Message);
 			Assert.Contains("values", ex.Message);
 		}
+
+		[Fact]
+		public void Lower_SerializedField_Instance_EmitsInstanceTypeAndConstraint()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+using RobloxCSharp.RobloxApi;
+public class Anchor : Component
+{
+	[SerializedField] private Instance target;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root);
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("target", rendered);
+			Assert.Contains("type = \"instance\"", rendered);
+			Assert.Contains("constraint = \"Instance\"", rendered);
+			Assert.Contains("default = \"\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_BasePartSubclass_CarriesConcreteConstraint()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+using RobloxCSharp.RobloxApi;
+public class Anchor : Component
+{
+	[SerializedField] private BasePart target;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root);
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"instance\"", rendered);
+			Assert.Contains("constraint = \"BasePart\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_Poco_EmitsCompositeFields()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Stats
+{
+	public int Health = 100;
+	public int Mana = 50;
+}
+public class Player : Component
+{
+	[SerializedField] private Stats stats;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Player");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"composite\"", rendered);
+			Assert.Contains("Health", rendered);
+			Assert.Contains("Mana", rendered);
+			Assert.Contains("default = 100", rendered);
+			Assert.Contains("default = 50", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_NestedPoco_FlattensThroughComposite()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Inner { public int X = 7; }
+public class Outer { public Inner Sub; }
+public class Box : Component
+{
+	[SerializedField] private Outer outer;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Box");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			// Outer composite contains Sub composite which contains X = 7.
+			Assert.Contains("Sub", rendered);
+			Assert.Contains("X", rendered);
+			Assert.Contains("default = 7", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_PocoMixesInstanceLeaf()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+using RobloxCSharp.RobloxApi;
+public class Refs { public BasePart Anchor; public int Slot = 1; }
+public class Beacon : Component
+{
+	[SerializedField] private Refs refs;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Beacon");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"composite\"", rendered);
+			Assert.Contains("type = \"instance\"", rendered);
+			Assert.Contains("constraint = \"BasePart\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_CyclicPoco_Throws()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class A { public B Next; }
+public class B { public A Back; }
+public class Loop : Component
+{
+	[SerializedField] private A a;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Loop");
+
+			InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
+				() => ComponentLowering.Lower(state, cls));
+			Assert.Contains("cyclic", ex.Message);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_Enum_EmitsEnumEntryAndValues()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public enum MoveState { Idle, Running, Jumping }
+public class Mover : Component
+{
+	[SerializedField] private MoveState state;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Mover");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"enum\"", rendered);
+			Assert.Contains("constraint = \"MoveState\"", rendered);
+			Assert.Contains("name = \"Idle\"", rendered);
+			Assert.Contains("name = \"Running\"", rendered);
+			Assert.Contains("name = \"Jumping\"", rendered);
+			Assert.Contains("value = 0", rendered);
+			Assert.Contains("value = 1", rendered);
+			Assert.Contains("value = 2", rendered);
+			Assert.Contains("default = 0", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_EnumWithInitializer_UsesInitializerOrdinal()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public enum MoveState { Idle, Running, Jumping }
+public class Mover : Component
+{
+	[SerializedField] private MoveState state = MoveState.Running;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Mover");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("default = 1", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_EnumInsideComposite_RecursesIntoEnum()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public enum Color { Red, Green, Blue }
+public class Skin { public Color Tone; }
+public class Avatar : Component
+{
+	[SerializedField] private Skin skin;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Avatar");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"composite\"", rendered);
+			Assert.Contains("type = \"enum\"", rendered);
+			Assert.Contains("constraint = \"Color\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_PocoWithUnsupportedLeaf_Throws()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Bag { public System.Collections.Generic.List<int> Items; }
+public class Backpack : Component
+{
+	[SerializedField] private Bag bag;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Backpack");
+
+			InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
+				() => ComponentLowering.Lower(state, cls));
+			Assert.Contains("Items", ex.Message);
+		}
 	}
 }

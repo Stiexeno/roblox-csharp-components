@@ -7,6 +7,7 @@ global using Microsoft.CodeAnalysis.CSharp;
 global using Microsoft.CodeAnalysis.CSharp.Syntax;
 global using RobloxCSharp.Common.Diagnostics;
 global using RobloxCSharp.Plugins;
+global using RobloxCSharp.Renderer;
 global using RobloxCSharp.Rojo;
 global using RobloxCSharp.Transformer;
 global using RobloxCSharp.Transformer.AST;

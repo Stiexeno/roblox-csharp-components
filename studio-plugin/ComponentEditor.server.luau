@@ -30,6 +30,8 @@ local Selection = game:GetService("Selection")
 local CollectionService = game:GetService("CollectionService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
 
 local TAG_PREFIX = "Component:"
 
@@ -47,11 +49,21 @@ local TAG_PREFIX = "Component:"
 -- the lifetime of the Studio session. Default is expanded.
 local sectionExpanded = {}
 
+-- Per-composite-field expanded state, keyed by the flat attribute prefix
+-- (e.g. "Player_stats_sub"). Sticky across selection / rebuilds.
+local compositeExpanded = {}
+
 -- Forward declaration. Assigned near the bottom of the file once
 -- `widget` and `build` exist. Click handlers reference this through
 -- the closure so they see the assigned function at call time, not
 -- the nil at definition time.
 local refresh
+
+-- Currently-armed instance picker, or nil. While non-nil, the next
+-- selection that satisfies the constraint is treated as the pick
+-- (not as a normal "show the selection's components" rebuild).
+--   { ownerInstance, attrName, constraint, button, label }
+local armedPicker
 
 ----------------------------------------------------------------------
 -- Theme
@@ -187,23 +199,31 @@ end
 -- disconnect AttributeChangedSignal listeners on every redraw.
 ----------------------------------------------------------------------
 
--- Native Properties uses a single flat row colour (no banding) and a
--- faint vertical divider at the label / value column boundary. The
--- rowIndex argument is retained for API compatibility with callers
--- that still pass it; the value is unused.
---
--- Row / header colours are hardcoded to the dark-theme hex values that
--- match the native pane exactly. We don't theme-track these because
--- the dark palette is the design target.
-local ROW_COLOR = Color3.fromHex("#191A1F")
-local HEADER_COLOR = Color3.fromHex("#202227")
+-- Card-style chrome (Compo-inspired): brighter elevated component
+-- sections sitting on a slightly darker page background, rounded
+-- corners, no column divider line, larger headers. Dark palette only.
+local PAGE_COLOR = Color3.fromHex("#15161A")
+local CARD_COLOR = Color3.fromHex("#23252B")
+local HEADER_COLOR = Color3.fromHex("#2D2F37")
+local ROW_COLOR = CARD_COLOR
 local ROW_HOVER_COLOR = Color3.fromHex("#353741")
+local ACCENT_COLOR = Color3.fromHex("#3D7EFF")
 
-local function buildFieldRow(parent, fieldName, _rowIndex)
+local function roundCorners(parent, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius or 6)
+	corner.Parent = parent
+	return corner
+end
+
+local function buildFieldRow(parent, fieldName, _rowIndex, depth)
+	depth = depth or 0
+	local labelX = 14 + depth * 14
+
 	local row = makeFrame({
 		parent = parent,
 		color = ROW_COLOR,
-		size = UDim2.new(1, 0, 0, 22),
+		size = UDim2.new(1, 0, 0, 24),
 	})
 
 	-- Hover highlight. Active = true is required on Frame for the
@@ -217,36 +237,27 @@ local function buildFieldRow(parent, fieldName, _rowIndex)
 		row.BackgroundColor3 = ROW_COLOR
 	end)
 
-	-- Left column: field label. Indented to align with the section
-	-- header text (which sits past the chevron at ~24px).
+	-- Left column: field label. Indented by `depth` levels for nested
+	-- composite leaves so they line up under their parent foldout.
 	makeLabel({
 		parent = row,
 		text = fieldName,
 		color = color("MainText"),
-		frameSize = UDim2.new(0.45, -24, 1, 0),
-		position = UDim2.new(0, 24, 0, 0),
-	})
-
-	-- Hairline divider between the label and value columns — matches
-	-- the subtle vertical line in the native pane.
-	makeFrame({
-		parent = row,
-		color = color("Border"),
-		size = UDim2.new(0, 1, 1, 0),
-		position = UDim2.new(0.45, 0, 0, 0),
+		frameSize = UDim2.new(0.4, -labelX, 1, 0),
+		position = UDim2.new(0, labelX, 0, 0),
 	})
 
 	-- Right column: value slot. Transparent so the row background
-	-- shows through — the native pane doesn't wrap values in a
-	-- distinct input-field rectangle.
+	-- shows through — no rectangle around input widgets, no divider
+	-- line, matches Compo's flat card aesthetic.
 	local valueSlot = makeFrame({
 		parent = row,
 		color = ROW_COLOR,
 		transparency = 1,
-		size = UDim2.new(0.55, -1, 1, 0),
-		position = UDim2.new(0.45, 1, 0, 0),
+		size = UDim2.new(0.6, -8, 1, 0),
+		position = UDim2.new(0.4, 0, 0, 0),
 	})
-	makePadding(valueSlot, 8, 6, 0, 0)
+	makePadding(valueSlot, 8, 8, 0, 0)
 	return row, valueSlot
 end
 
@@ -265,8 +276,8 @@ local function makeValueTextBox(parent, initialText)
 	return box
 end
 
-local function createNumberEditor(parent, fieldName, instance, attrName, rowIndex)
-	local _, slot = buildFieldRow(parent, fieldName, rowIndex)
+local function createNumberEditor(parent, fieldName, instance, attrName, rowIndex, _fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
 	local box = makeValueTextBox(slot, tostring(instance:GetAttribute(attrName) or 0))
 
 	box.FocusLost:Connect(function()
@@ -287,8 +298,8 @@ local function createNumberEditor(parent, fieldName, instance, attrName, rowInde
 	return function() conn:Disconnect() end
 end
 
-local function createStringEditor(parent, fieldName, instance, attrName, rowIndex)
-	local _, slot = buildFieldRow(parent, fieldName, rowIndex)
+local function createStringEditor(parent, fieldName, instance, attrName, rowIndex, _fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
 	local box = makeValueTextBox(slot, tostring(instance:GetAttribute(attrName) or ""))
 
 	box.FocusLost:Connect(function()
@@ -302,8 +313,8 @@ local function createStringEditor(parent, fieldName, instance, attrName, rowInde
 	return function() conn:Disconnect() end
 end
 
-local function createBooleanEditor(parent, fieldName, instance, attrName, rowIndex)
-	local _, slot = buildFieldRow(parent, fieldName, rowIndex)
+local function createBooleanEditor(parent, fieldName, instance, attrName, rowIndex, _fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
 	-- For booleans we draw a small checkbox-style square left-aligned
 	-- in the value well instead of a text widget.
 	local toggle = Instance.new("TextButton")
@@ -330,14 +341,425 @@ local function createBooleanEditor(parent, fieldName, instance, attrName, rowInd
 	return function() conn:Disconnect() end
 end
 
--- Dispatch table by SerializedField type. Add new types here as the
--- system grows; the inspector silently skips fields it doesn't know
--- how to edit so partial type support is OK.
-local EDITORS = {
-	number = createNumberEditor,
-	string = createStringEditor,
-	boolean = createBooleanEditor,
-}
+-- Instance-ref helpers. Mirror runtime/InstanceRegistry.luau but
+-- scoped to the plugin so edit-time picks don't depend on the runtime
+-- service being booted. The "_uid" attribute is the same on-Instance
+-- handle the runtime uses, so picks made here are visible at play.
+local function bindUid(inst)
+	local uid = inst:GetAttribute("_uid")
+	if typeof(uid) ~= "string" or uid == "" then
+		uid = HttpService:GenerateGUID(false)
+		inst:SetAttribute("_uid", uid)
+	end
+	return uid
+end
+
+local function resolveByUid(uid)
+	if typeof(uid) ~= "string" or uid == "" then return nil end
+	for _, root in ipairs({ Workspace, ReplicatedStorage }) do
+		if root:GetAttribute("_uid") == uid then return root end
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:GetAttribute("_uid") == uid then return d end
+		end
+	end
+	return nil
+end
+
+local function disarmPicker()
+	if not armedPicker then return end
+	local p = armedPicker
+	armedPicker = nil
+	if p.button.Parent then
+		p.button.Text = "Pick"
+		p.button.BackgroundColor3 = color("Button")
+	end
+end
+
+local function createInstanceEditor(parent, fieldName, instance, attrName, rowIndex, fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
+	local constraint = fieldDef.constraint or "Instance"
+
+	-- Display label on the left of the slot, picker controls on the right.
+	local display = Instance.new("TextLabel")
+	display.BackgroundTransparency = 1
+	display.TextColor3 = color("MainText")
+	display.Font = Enum.Font.SourceSans
+	display.TextSize = 14
+	display.TextXAlignment = Enum.TextXAlignment.Left
+	display.TextTruncate = Enum.TextTruncate.AtEnd
+	display.Size = UDim2.new(1, -110, 1, 0)
+	display.Parent = slot
+
+	local function paintDisplay()
+		local uid = instance:GetAttribute(attrName)
+		local resolved = resolveByUid(uid)
+		if resolved then
+			display.Text = resolved.Name .. " (" .. resolved.ClassName .. ")"
+			display.TextColor3 = color("MainText")
+		elseif typeof(uid) == "string" and uid ~= "" then
+			display.Text = "Missing"
+			display.TextColor3 = color("ErrorText")
+		else
+			display.Text = "(none)"
+			display.TextColor3 = color("DimmedText")
+		end
+	end
+	paintDisplay()
+
+	local pick = Instance.new("TextButton")
+	pick.BackgroundColor3 = color("Button")
+	pick.BorderColor3 = color("Border")
+	pick.BorderSizePixel = 1
+	pick.Text = "Pick"
+	pick.TextColor3 = color("ButtonText")
+	pick.Font = Enum.Font.SourceSans
+	pick.TextSize = 13
+	pick.Size = UDim2.new(0, 50, 0, 18)
+	pick.Position = UDim2.new(1, -106, 0.5, -9)
+	pick.AutoButtonColor = true
+	pick.Parent = slot
+
+	local clear = Instance.new("TextButton")
+	clear.BackgroundColor3 = color("Button")
+	clear.BorderColor3 = color("Border")
+	clear.BorderSizePixel = 1
+	clear.Text = "Clear"
+	clear.TextColor3 = color("ButtonText")
+	clear.Font = Enum.Font.SourceSans
+	clear.TextSize = 13
+	clear.Size = UDim2.new(0, 50, 0, 18)
+	clear.Position = UDim2.new(1, -52, 0.5, -9)
+	clear.AutoButtonColor = true
+	clear.Parent = slot
+
+	pick.MouseButton1Click:Connect(function()
+		if armedPicker and armedPicker.button == pick then
+			disarmPicker()
+			return
+		end
+		disarmPicker()
+		armedPicker = {
+			ownerInstance = instance,
+			attrName = attrName,
+			constraint = constraint,
+			button = pick,
+			label = display,
+		}
+		pick.Text = "Cancel"
+		pick.BackgroundColor3 = color("DialogMainButton")
+	end)
+
+	clear.MouseButton1Click:Connect(function()
+		disarmPicker()
+		instance:SetAttribute(attrName, "")
+	end)
+
+	local conn = instance:GetAttributeChangedSignal(attrName):Connect(paintDisplay)
+	return function() conn:Disconnect() end
+end
+
+-- Property-drawer registry. Each drawer is a function with the
+-- signature:
+--   draw(parent, fieldName, instance, attrName, rowIndex, fieldDef, depth)
+--     -> cleanupFn
+-- Built-ins are registered below. Custom drawers picked up from user
+-- ModuleScripts override built-ins (later registration wins).
+--
+-- Resolution: a fieldDef with `constraint` first tries the specific
+-- key `<type>:<constraint>` (e.g. "enum:MoveState"), then falls back
+-- to the base type (`"enum"`). This lets a user drop in a drawer just
+-- for one enum without redefining the default enum picker.
+local drawerRegistry = {}
+
+local function registerDrawer(key, fn)
+	drawerRegistry[key] = fn
+end
+
+local function resolveDrawer(fieldDef)
+	if fieldDef.constraint then
+		local specific = drawerRegistry[fieldDef.type .. ":" .. fieldDef.constraint]
+		if specific then return specific end
+	end
+	return drawerRegistry[fieldDef.type]
+end
+
+registerDrawer("number", createNumberEditor)
+registerDrawer("string", createStringEditor)
+registerDrawer("boolean", createBooleanEditor)
+registerDrawer("instance", createInstanceEditor)
+
+-- Scans user code roots for ModuleScripts shaped like:
+--   return { DrawerFor = "<key>", Draw = function(...) ... end }
+-- and registers each one. Source pre-filter avoids requiring random
+-- modules. Called once per build() so newly-saved drawer files pick
+-- up at the next refresh (within the limits of ModuleScript caching).
+local function looksLikeDrawerSource(moduleScript)
+	local ok, source = pcall(function() return moduleScript.Source end)
+	if not ok or type(source) ~= "string" then return false end
+	return string.find(source, "DrawerFor", 1, true) ~= nil
+end
+
+local function loadCustomDrawers()
+	for _, root in ipairs(discoveryRoots()) do
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if descendant:IsA("ModuleScript") and looksLikeDrawerSource(descendant) then
+				local ok, mod = pcall(require, descendant)
+				if ok and type(mod) == "table"
+					and type(mod.DrawerFor) == "string"
+					and type(mod.Draw) == "function" then
+					registerDrawer(mod.DrawerFor, mod.Draw)
+				end
+			end
+		end
+	end
+end
+
+-- Composite (nested-POCO) editor. Renders a foldout header at this
+-- depth; expanded, recurses into each child via EDITORS at depth+1.
+-- Children's attribute names extend the parent prefix with "_<child>",
+-- matching the flat layout the lowering emits.
+local function createCompositeEditor(parent, fieldName, instance, attrName, _rowIndex, fieldDef, depth)
+	depth = depth or 0
+	local labelX = 24 + depth * 12
+
+	local key = attrName
+	local expanded = compositeExpanded[key]
+	if expanded == nil then expanded = true end
+
+	local row = Instance.new("TextButton")
+	row.BackgroundColor3 = ROW_COLOR
+	row.BorderSizePixel = 0
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.Size = UDim2.new(1, 0, 0, 22)
+	row.Parent = parent
+
+	row.MouseEnter:Connect(function() row.BackgroundColor3 = ROW_HOVER_COLOR end)
+	row.MouseLeave:Connect(function() row.BackgroundColor3 = ROW_COLOR end)
+
+	makeLabel({
+		parent = row,
+		text = expanded and "▾" or "▸",
+		color = color("MainText"),
+		size = 14,
+		frameSize = UDim2.new(0, 14, 1, 0),
+		position = UDim2.new(0, labelX - 18, 0, 0),
+	})
+	makeLabel({
+		parent = row,
+		text = fieldName,
+		color = color("MainText"),
+		font = Enum.Font.SourceSansItalic,
+		frameSize = UDim2.new(1, -labelX, 1, 0),
+		position = UDim2.new(0, labelX, 0, 0),
+	})
+
+	row.MouseButton1Click:Connect(function()
+		compositeExpanded[key] = not expanded
+		refresh()
+	end)
+
+	if not expanded then return function() end end
+
+	local childNames = {}
+	for name in pairs(fieldDef.fields) do
+		table.insert(childNames, name)
+	end
+	table.sort(childNames)
+
+	local cleanups = {}
+	for i, childName in ipairs(childNames) do
+		local childDef = fieldDef.fields[childName]
+		local childEditor = resolveDrawer(childDef)
+		if childEditor then
+			local childAttr = attrName .. "_" .. childName
+			table.insert(cleanups,
+				childEditor(parent, childName, instance, childAttr, i, childDef, depth + 1))
+		end
+	end
+
+	return function()
+		for _, fn in ipairs(cleanups) do
+			pcall(fn)
+		end
+	end
+end
+
+registerDrawer("composite", createCompositeEditor)
+
+-- Enum drawer: a closed-state button shows the current member name;
+-- click opens a searchable dropdown anchored to the row. Storage is
+-- the int ordinal (matches the converter's enum lowering — Idle = 0,
+-- Running = 1, ...), so user code comparing `self.state == State.Idle`
+-- works without translation.
+local function createEnumEditor(parent, fieldName, instance, attrName, rowIndex, fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
+	local values = fieldDef.values or {}
+
+	local nameByValue = {}
+	for _, item in ipairs(values) do
+		nameByValue[item.value] = item.name
+	end
+
+	local button = Instance.new("TextButton")
+	button.BackgroundColor3 = HEADER_COLOR
+	button.BorderSizePixel = 0
+	button.Text = ""
+	button.AutoButtonColor = true
+	button.Size = UDim2.fromScale(1, 1)
+	button.Parent = slot
+	roundCorners(button, 4)
+
+	local nameLabel = makeLabel({
+		parent = button,
+		text = "",
+		color = color("MainText"),
+		frameSize = UDim2.new(1, -22, 1, 0),
+		position = UDim2.new(0, 8, 0, 0),
+	})
+	makeLabel({
+		parent = button,
+		text = "▾",
+		color = color("DimmedText"),
+		frameSize = UDim2.new(0, 14, 1, 0),
+		position = UDim2.new(1, -18, 0, 0),
+	})
+
+	local function paintName()
+		local cur = instance:GetAttribute(attrName)
+		nameLabel.Text = nameByValue[cur] or "?"
+	end
+	paintName()
+
+	local dropdown
+	local backdrop
+	local function closeDropdown()
+		if dropdown then dropdown:Destroy() dropdown = nil end
+		if backdrop then backdrop:Destroy() backdrop = nil end
+	end
+
+	local function openDropdown()
+		closeDropdown()
+
+		local btnAbsPos = button.AbsolutePosition
+		local btnAbsSize = button.AbsoluteSize
+		local widgetAbsPos = widget.AbsolutePosition
+
+		-- Backdrop catches clicks outside the popup to close it; pure
+		-- input target, invisible.
+		backdrop = Instance.new("TextButton")
+		backdrop.Size = UDim2.fromScale(1, 1)
+		backdrop.BackgroundTransparency = 1
+		backdrop.Text = ""
+		backdrop.AutoButtonColor = false
+		backdrop.ZIndex = 49
+		backdrop.Parent = widget
+		backdrop.MouseButton1Click:Connect(closeDropdown)
+
+		dropdown = Instance.new("Frame")
+		dropdown.BackgroundColor3 = CARD_COLOR
+		dropdown.BorderSizePixel = 0
+		dropdown.ZIndex = 50
+		dropdown.Size = UDim2.new(0, btnAbsSize.X, 0, math.min(220, 36 + #values * 22))
+		dropdown.Position = UDim2.new(
+			0, btnAbsPos.X - widgetAbsPos.X,
+			0, btnAbsPos.Y - widgetAbsPos.Y + btnAbsSize.Y + 2)
+		dropdown.Parent = widget
+		roundCorners(dropdown, 6)
+		makeStroke(dropdown, color("Border"))
+
+		local searchHost = makeFrame({
+			parent = dropdown,
+			color = HEADER_COLOR,
+			size = UDim2.new(1, -8, 0, 24),
+			position = UDim2.new(0, 4, 0, 4),
+		})
+		searchHost.ZIndex = 51
+		roundCorners(searchHost, 4)
+		makePadding(searchHost, 8, 8, 0, 0)
+
+		local searchBox = Instance.new("TextBox")
+		searchBox.BackgroundTransparency = 1
+		searchBox.PlaceholderText = "Search…"
+		searchBox.PlaceholderColor3 = color("DimmedText")
+		searchBox.Text = ""
+		searchBox.TextColor3 = color("MainText")
+		searchBox.Font = Enum.Font.SourceSans
+		searchBox.TextSize = 14
+		searchBox.TextXAlignment = Enum.TextXAlignment.Left
+		searchBox.Size = UDim2.fromScale(1, 1)
+		searchBox.ZIndex = 51
+		searchBox.ClearTextOnFocus = false
+		searchBox.Parent = searchHost
+
+		local list = Instance.new("ScrollingFrame")
+		list.Size = UDim2.new(1, -8, 1, -36)
+		list.Position = UDim2.new(0, 4, 0, 32)
+		list.BackgroundTransparency = 1
+		list.BorderSizePixel = 0
+		list.ScrollBarThickness = 4
+		list.CanvasSize = UDim2.new()
+		list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		list.ZIndex = 51
+		list.Parent = dropdown
+
+		local listLayout = Instance.new("UIListLayout")
+		listLayout.Padding = UDim.new(0, 1)
+		listLayout.Parent = list
+
+		local function rebuildItems()
+			for _, c in ipairs(list:GetChildren()) do
+				if c:IsA("TextButton") then c:Destroy() end
+			end
+			local query = searchBox.Text:lower()
+			for _, item in ipairs(values) do
+				if query == "" or item.name:lower():find(query, 1, true) then
+					local row = Instance.new("TextButton")
+					row.BackgroundColor3 = HEADER_COLOR
+					row.BackgroundTransparency = 1
+					row.BorderSizePixel = 0
+					row.Text = item.name
+					row.TextColor3 = color("MainText")
+					row.Font = Enum.Font.SourceSans
+					row.TextSize = 14
+					row.TextXAlignment = Enum.TextXAlignment.Left
+					row.Size = UDim2.new(1, 0, 0, 20)
+					row.AutoButtonColor = false
+					row.ZIndex = 51
+					row.Parent = list
+
+					local rowPad = Instance.new("UIPadding")
+					rowPad.PaddingLeft = UDim.new(0, 8)
+					rowPad.Parent = row
+
+					row.MouseEnter:Connect(function() row.BackgroundTransparency = 0 end)
+					row.MouseLeave:Connect(function() row.BackgroundTransparency = 1 end)
+
+					row.MouseButton1Click:Connect(function()
+						instance:SetAttribute(attrName, item.value)
+						closeDropdown()
+					end)
+				end
+			end
+		end
+
+		searchBox:GetPropertyChangedSignal("Text"):Connect(rebuildItems)
+		rebuildItems()
+		searchBox:CaptureFocus()
+	end
+
+	button.MouseButton1Click:Connect(function()
+		if dropdown then closeDropdown() else openDropdown() end
+	end)
+
+	local conn = instance:GetAttributeChangedSignal(attrName):Connect(paintName)
+	return function()
+		conn:Disconnect()
+		closeDropdown()
+	end
+end
+
+registerDrawer("enum", createEnumEditor)
 
 ----------------------------------------------------------------------
 -- Component section
@@ -353,20 +775,32 @@ local function buildComponentSection(parent, instance, componentName, def, clean
 	local expanded = sectionExpanded[componentName]
 	if expanded == nil then expanded = true end
 
-	-- Header is itself a TextButton so the whole bar toggles expand /
-	-- collapse — matches Studio's Properties-panel section behavior.
-	-- The Remove button inside it catches its own clicks (Roblox doesn't
-	-- bubble UI input), so it won't accidentally toggle the section.
-	-- No UIStroke: the native Properties pane uses a flat CategoryItem
-	-- bar with no visible border, distinguished from row chrome only by
-	-- its slightly lighter colour.
+	-- Card wrapper: rounded, elevated above the page background.
+	-- AutomaticSize.Y means the card grows with its children; the
+	-- outer scroll layout reflows accordingly.
+	local card = Instance.new("Frame")
+	card.BackgroundColor3 = CARD_COLOR
+	card.BorderSizePixel = 0
+	card.Size = UDim2.new(1, -16, 0, 0)
+	card.AutomaticSize = Enum.AutomaticSize.Y
+	card.ClipsDescendants = true
+	card.Parent = parent
+	roundCorners(card, 8)
+
+	local cardLayout = Instance.new("UIListLayout")
+	cardLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	cardLayout.Parent = card
+
+	-- Header: clickable strip with a chevron, bold component name, and
+	-- a Remove control. The whole bar (minus Remove) toggles expand.
 	local header = Instance.new("TextButton")
 	header.BackgroundColor3 = HEADER_COLOR
 	header.BorderSizePixel = 0
 	header.Text = ""
 	header.AutoButtonColor = false
-	header.Size = UDim2.new(1, 0, 0, 22)
-	header.Parent = parent
+	header.Size = UDim2.new(1, 0, 0, 30)
+	header.LayoutOrder = 0
+	header.Parent = card
 
 	makeLabel({
 		parent = header,
@@ -374,33 +808,32 @@ local function buildComponentSection(parent, instance, componentName, def, clean
 		color = color("MainText"),
 		size = 14,
 		frameSize = UDim2.new(0, 14, 1, 0),
-		position = UDim2.new(0, 6, 0, 0),
+		position = UDim2.new(0, 10, 0, 0),
 	})
 
 	makeLabel({
 		parent = header,
 		text = componentName,
 		color = color("BrightText"),
-		size = 14,
+		size = 15,
 		font = Enum.Font.SourceSansBold,
 		frameSize = UDim2.new(1, -100, 1, 0),
-		position = UDim2.new(0, 24, 0, 0),
+		position = UDim2.new(0, 28, 0, 0),
 	})
 
-	-- Remove control on the right. Calls refresh inline because Roblox
-	-- doesn't give us a per-instance tag-changed signal to react to.
+	-- Remove control on the right. Compact pill button, accent-aware.
 	local remove = Instance.new("TextButton")
-	remove.BackgroundColor3 = color("Button")
-	remove.BorderColor3 = color("Border")
-	remove.BorderSizePixel = 1
+	remove.BackgroundColor3 = HEADER_COLOR
+	remove.BorderSizePixel = 0
 	remove.Text = "Remove"
-	remove.TextColor3 = color("ButtonText")
+	remove.TextColor3 = color("DimmedText")
 	remove.Font = Enum.Font.SourceSans
 	remove.TextSize = 13
-	remove.Size = UDim2.new(0, 60, 0, 18)
-	remove.Position = UDim2.new(1, -66, 0.5, -9)
+	remove.Size = UDim2.new(0, 60, 0, 20)
+	remove.Position = UDim2.new(1, -68, 0.5, -10)
 	remove.AutoButtonColor = true
 	remove.Parent = header
+	roundCorners(remove, 4)
 
 	remove.MouseButton1Click:Connect(function()
 		CollectionService:RemoveTag(instance, TAG_PREFIX .. componentName)
@@ -427,15 +860,15 @@ local function buildComponentSection(parent, instance, componentName, def, clean
 
 	for i, fieldName in ipairs(fieldNames) do
 		local fieldDef = def.SerializedFields[fieldName]
-		local editor = EDITORS[fieldDef.type]
+		local editor = resolveDrawer(fieldDef)
 		if editor then
 			local attrName = componentName .. "_" .. fieldName
-			table.insert(cleanupTasks, editor(parent, fieldName, instance, attrName, i))
+			table.insert(cleanupTasks, editor(card, fieldName, instance, attrName, i, fieldDef))
 		else
 			local row = makeFrame({
-				parent = parent,
-				color = color("TableItem"),
-				size = UDim2.new(1, 0, 0, 22),
+				parent = card,
+				color = CARD_COLOR,
+				size = UDim2.new(1, 0, 0, 24),
 			})
 			makeLabel({
 				parent = row,
@@ -661,16 +1094,17 @@ local function build()
 		child:Destroy()
 	end
 
-	-- Outer panel matches Studio's main backdrop.
+	-- Outer panel — slightly darker than the cards on top, so the
+	-- elevation reads.
 	local root = Instance.new("Frame")
 	root.Size = UDim2.fromScale(1, 1)
-	root.BackgroundColor3 = color("MainBackground")
+	root.BackgroundColor3 = PAGE_COLOR
 	root.BorderSizePixel = 0
 	root.Parent = widget
 
 	-- Top area scrolls; the Add Component button is pinned to the bottom.
 	local scroll = Instance.new("ScrollingFrame")
-	scroll.Size = UDim2.new(1, 0, 1, -36)
+	scroll.Size = UDim2.new(1, 0, 1, -48)
 	scroll.BackgroundTransparency = 1
 	scroll.BorderSizePixel = 0
 	scroll.ScrollBarThickness = 6
@@ -678,19 +1112,24 @@ local function build()
 	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	scroll.Parent = root
 
-	-- UIListLayout's default SortOrder is `Name`, which would sort our
-	-- Frame-typed field rows and the TextButton-typed section header
-	-- alphabetically ("Frame" < "TextButton") — putting all field rows
-	-- above the header. Force LayoutOrder so children render in the
-	-- order they were parented instead.
+	-- 8px gap between component cards; small lateral padding so the
+	-- cards float on the page background.
 	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 0)
+	layout.Padding = UDim.new(0, 8)
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = scroll
 
-	-- Definitions check first. loadDefinitions always returns a table;
-	-- emptiness signals the project doesn't have any `: Component`
-	-- subclasses yet (or none have made it through compile + sync).
+	local scrollPad = Instance.new("UIPadding")
+	scrollPad.PaddingTop = UDim.new(0, 8)
+	scrollPad.PaddingBottom = UDim.new(0, 8)
+	scrollPad.Parent = scroll
+
+	-- Pick up any user-supplied property drawers (re-registers every
+	-- build so newly-saved drawer modules take effect at the next
+	-- refresh). Then load component definitions; emptiness signals the
+	-- project doesn't have any `: Component` subclasses yet.
+	loadCustomDrawers()
 	local defs = loadDefinitions()
 	if not next(defs) then
 		local block = makeFrame({
@@ -802,26 +1241,26 @@ local function build()
 		size = 13,
 	})
 
-	-- Pinned bottom bar: the "Add Component" button.
+	-- Pinned bottom bar: the "Add Component" button, accent-styled.
 	local bottomBar = makeFrame({
 		parent = root,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 36),
-		position = UDim2.new(0, 0, 1, -36),
+		color = PAGE_COLOR,
+		size = UDim2.new(1, 0, 0, 48),
+		position = UDim2.new(0, 0, 1, -48),
 	})
-	makePadding(bottomBar, 12, 12, 6, 6)
+	makePadding(bottomBar, 12, 12, 8, 8)
 
 	local addButton = Instance.new("TextButton")
-	addButton.BackgroundColor3 = color("DialogMainButton")
-	addButton.BorderColor3 = color("Border")
-	addButton.BorderSizePixel = 1
-	addButton.Text = "Add Component"
-	addButton.TextColor3 = color("DialogMainButtonText")
+	addButton.BackgroundColor3 = ACCENT_COLOR
+	addButton.BorderSizePixel = 0
+	addButton.Text = "+  Add Component"
+	addButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 	addButton.Font = Enum.Font.SourceSansSemibold
-	addButton.TextSize = 14
+	addButton.TextSize = 15
 	addButton.Size = UDim2.fromScale(1, 1)
 	addButton.AutoButtonColor = true
 	addButton.Parent = bottomBar
+	roundCorners(addButton, 6)
 
 	addButton.MouseButton1Click:Connect(function()
 		openPicker(root, selected, defs, attached)
@@ -860,7 +1299,25 @@ refresh = function()
 end
 
 widget:GetPropertyChangedSignal("Enabled"):Connect(refresh)
-Selection.SelectionChanged:Connect(refresh)
+Selection.SelectionChanged:Connect(function()
+	-- When a picker is armed, treat the next selection as the pick
+	-- instead of a normal "show this Instance's components" rebuild.
+	-- Selecting the field's own owner (i.e. clicking back at the
+	-- component) cancels the pick.
+	if armedPicker then
+		local picked = Selection:Get()[1]
+		local p = armedPicker
+		if picked and picked ~= p.ownerInstance and picked:IsA(p.constraint) then
+			local uid = bindUid(picked)
+			p.ownerInstance:SetAttribute(p.attrName, uid)
+			disarmPicker()
+			Selection:Set({ p.ownerInstance })
+			return
+		end
+		disarmPicker()
+	end
+	refresh()
+end)
 -- Note: there's no per-Instance tag-changed signal in Roblox. The
 -- global CollectionService.TagAdded only fires the first time a tag
 -- name appears anywhere in the place, so we can't lean on it. Add /
@@ -872,11 +1329,15 @@ Selection.SelectionChanged:Connect(refresh)
 -- refresh in one pass.
 studio.ThemeChanged:Connect(refresh)
 
--- ESC key dismisses the picker overlay if it's up.
+-- ESC key dismisses the picker overlay or disarms an instance picker.
 UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then return end
-	if input.KeyCode == Enum.KeyCode.Escape and pickerOverlay then
-		closePicker()
+	if input.KeyCode == Enum.KeyCode.Escape then
+		if pickerOverlay then
+			closePicker()
+		elseif armedPicker then
+			disarmPicker()
+		end
 	end
 end)
 

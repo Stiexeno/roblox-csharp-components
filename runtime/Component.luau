@@ -20,8 +20,63 @@
 -- attribute edits (e.g. dragging a slider in the Studio plugin during play)
 -- also propagate into the component via an AttributeChangedSignal listener.
 
+local InstanceRegistry = require(script.Parent.InstanceRegistry)
+
 local Component = {}
 Component.__index = Component
+
+-- Recursively writes the default for every leaf attribute under `prefix`
+-- that isn't already set. Composite fields don't have an attribute of
+-- their own — only their leaves do.
+local function initLeafDefaults(instance, prefix, fields)
+	for fieldName, fieldDef in pairs(fields) do
+		local attrName = prefix .. "_" .. fieldName
+		if fieldDef.type == "composite" then
+			initLeafDefaults(instance, attrName, fieldDef.fields)
+		else
+			if instance:GetAttribute(attrName) == nil then
+				instance:SetAttribute(attrName, fieldDef.default)
+			end
+		end
+	end
+end
+
+-- Returns a proxy table whose reads/writes route to flat-named
+-- attributes under `prefix`. Nested composites yield deeper proxies on
+-- demand. Replacing a composite (proxy[k] = newComposite) batch-writes
+-- each leaf from `v[subName]`.
+local function makeCompositeProxy(instance, prefix, fields)
+	return setmetatable({}, {
+		__index = function(_, k)
+			local fieldDef = fields[k]
+			if not fieldDef then return nil end
+			local attrName = prefix .. "_" .. k
+			if fieldDef.type == "composite" then
+				return makeCompositeProxy(instance, attrName, fieldDef.fields)
+			elseif fieldDef.type == "instance" then
+				return InstanceRegistry.resolve(instance:GetAttribute(attrName))
+			else
+				return instance:GetAttribute(attrName)
+			end
+		end,
+		__newindex = function(_, k, v)
+			local fieldDef = fields[k]
+			if not fieldDef then return end
+			local attrName = prefix .. "_" .. k
+			if fieldDef.type == "composite" then
+				local sub = makeCompositeProxy(instance, attrName, fieldDef.fields)
+				for subName in pairs(fieldDef.fields) do
+					sub[subName] = v[subName]
+				end
+			elseif fieldDef.type == "instance" then
+				local uid = v and InstanceRegistry.bind(v) or ""
+				instance:SetAttribute(attrName, uid)
+			else
+				instance:SetAttribute(attrName, v)
+			end
+		end,
+	})
+end
 
 -- Constructs a definition table. The user fills in SerializedFields and
 -- lifecycle methods after this call.
@@ -54,25 +109,33 @@ function Component.spawn(definition, instance)
 	local serialized = {}
 	local connections = {}
 
-	-- Read each field from its attribute; write the default first if
-	-- the instance doesn't have a value yet so the inspector shows
-	-- something sensible.
+	-- Backfill any missing leaf attributes with their declared default,
+	-- then populate `serialized` per kind:
+	--   composite → cache one proxy table that lazily reads/writes
+	--               its leaf attributes through the metatable.
+	--   instance  → cache the resolved Instance; refresh on attribute
+	--               change so external picks propagate.
+	--   primitive → cache the scalar value; refresh on attribute change.
+	initLeafDefaults(instance, definition.ComponentName, definition.SerializedFields)
+
 	for fieldName, fieldDef in pairs(definition.SerializedFields) do
 		local attrName = Component.attrFor(definition.ComponentName, fieldName)
-		local current = instance:GetAttribute(attrName)
-		if current == nil then
-			instance:SetAttribute(attrName, fieldDef.default)
-			current = fieldDef.default
-		end
-		serialized[fieldName] = current
 
-		-- External attribute edits (e.g. inspector drag during play)
-		-- push back into `self` via the metatable. The component itself
-		-- can read `self.X` and always see the latest value.
-		local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
+		if fieldDef.type == "composite" then
+			serialized[fieldName] = makeCompositeProxy(instance, attrName, fieldDef.fields)
+		elseif fieldDef.type == "instance" then
+			serialized[fieldName] = InstanceRegistry.resolve(instance:GetAttribute(attrName))
+			local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
+				serialized[fieldName] = InstanceRegistry.resolve(instance:GetAttribute(attrName))
+			end)
+			table.insert(connections, conn)
+		else
 			serialized[fieldName] = instance:GetAttribute(attrName)
-		end)
-		table.insert(connections, conn)
+			local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
+				serialized[fieldName] = instance:GetAttribute(attrName)
+			end)
+			table.insert(connections, conn)
+		end
 	end
 
 	local self = {
@@ -98,9 +161,22 @@ function Component.spawn(definition, instance)
 		end,
 		__newindex = function(t, k, v)
 			local def = rawget(t, "_definition")
-			if def.SerializedFields[k] then
+			local fieldDef = def.SerializedFields[k]
+			if fieldDef then
 				local attrName = Component.attrFor(def.ComponentName, k)
-				t.Instance:SetAttribute(attrName, v)
+				if fieldDef.type == "instance" then
+					local uid = v and InstanceRegistry.bind(v) or ""
+					t.Instance:SetAttribute(attrName, uid)
+				elseif fieldDef.type == "composite" then
+					-- Whole-composite replace: route each leaf through
+					-- the cached proxy so nested composites recurse.
+					local proxy = rawget(t, "_serialized")[k]
+					for subName in pairs(fieldDef.fields) do
+						proxy[subName] = v[subName]
+					end
+				else
+					t.Instance:SetAttribute(attrName, v)
+				end
 			else
 				rawset(t, k, v)
 			end

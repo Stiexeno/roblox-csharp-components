@@ -14,8 +14,11 @@
 
 local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Component = require(script.Parent.Component)
+local InstanceRegistry = require(script.Parent.InstanceRegistry)
 
 local ComponentsService = setmetatable({}, {
 	__tostring = function() return "ComponentsService" end,
@@ -35,6 +38,11 @@ function ComponentsService:constructor(container)
 	self._registered = {}  -- [definition] = true; dedupes Register calls.
 	self._active = {}      -- [Instance][componentName] = live component.
 	self._connections = {} -- Disconnectables collected for OnDestroy.
+
+	-- Backfill the Instance registry so [SerializedField] reference
+	-- fields can resolve before the first component spawns.
+	InstanceRegistry.scan(Workspace)
+	InstanceRegistry.scan(ReplicatedStorage)
 
 	-- Update tick — runs on every component each Heartbeat regardless of
 	-- side. The pcall wrapper isolates a faulty Update from the rest of
