@@ -92,7 +92,7 @@ public class Health : Component
 using Components;
 public class Health : Component
 {
-	[SerializedField] private System.Collections.Generic.List<int> values;
+	[SerializedField] private System.Collections.Generic.Dictionary<string, int> values;
 }");
 			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root);
 
@@ -287,11 +287,119 @@ public class Avatar : Component
 		}
 
 		[Fact]
+		public void Lower_SerializedField_ListOfInt_EmitsListWithNumberElement()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Box : Component
+{
+	[SerializedField] private System.Collections.Generic.List<int> scores;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Box");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"list\"", rendered);
+			Assert.Contains("type = \"number\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_ArrayOfInt_TreatedAsList()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Box : Component
+{
+	[SerializedField] private int[] scores;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Box");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"list\"", rendered);
+			Assert.Contains("type = \"number\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_ListOfInstance_ElementIsInstanceWithConstraint()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+using RobloxCSharp.RobloxApi;
+public class Spawner : Component
+{
+	[SerializedField] private System.Collections.Generic.List<BasePart> points;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Spawner");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"list\"", rendered);
+			Assert.Contains("type = \"instance\"", rendered);
+			Assert.Contains("constraint = \"BasePart\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_ListOfPoco_ElementIsComposite()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Item { public int Id; public string Name; }
+public class Bag : Component
+{
+	[SerializedField] private System.Collections.Generic.List<Item> items;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Bag");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"list\"", rendered);
+			Assert.Contains("type = \"composite\"", rendered);
+			Assert.Contains("Id", rendered);
+			Assert.Contains("Name", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_ListOfEnum_ElementIsEnum()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public enum Tag { A, B, C }
+public class Tagged : Component
+{
+	[SerializedField] private System.Collections.Generic.List<Tag> tags;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Tagged");
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("type = \"list\"", rendered);
+			Assert.Contains("type = \"enum\"", rendered);
+			Assert.Contains("constraint = \"Tag\"", rendered);
+		}
+
+		[Fact]
+		public void Lower_SerializedField_NestedList_Throws()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Grid : Component
+{
+	[SerializedField] private System.Collections.Generic.List<System.Collections.Generic.List<int>> rows;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root, name: "Grid");
+
+			InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
+				() => ComponentLowering.Lower(state, cls));
+			Assert.Contains("nested list", ex.Message);
+		}
+
+		[Fact]
 		public void Lower_SerializedField_PocoWithUnsupportedLeaf_Throws()
 		{
 			(var state, var root, _) = TestHarness.Compile(@"
 using Components;
-public class Bag { public System.Collections.Generic.List<int> Items; }
+public class Bag { public System.Collections.Generic.Dictionary<string, int> Items; }
 public class Backpack : Component
 {
 	[SerializedField] private Bag bag;

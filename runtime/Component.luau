@@ -27,12 +27,18 @@ Component.__index = Component
 
 -- Recursively writes the default for every leaf attribute under `prefix`
 -- that isn't already set. Composite fields don't have an attribute of
--- their own — only their leaves do.
+-- their own — only their leaves do. Lists get an empty Count;
+-- per-element attributes are created on add.
 local function initLeafDefaults(instance, prefix, fields)
 	for fieldName, fieldDef in pairs(fields) do
 		local attrName = prefix .. "_" .. fieldName
 		if fieldDef.type == "composite" then
 			initLeafDefaults(instance, attrName, fieldDef.fields)
+		elseif fieldDef.type == "list" then
+			local countAttr = attrName .. "_Count"
+			if instance:GetAttribute(countAttr) == nil then
+				instance:SetAttribute(countAttr, 0)
+			end
 		else
 			if instance:GetAttribute(attrName) == nil then
 				instance:SetAttribute(attrName, fieldDef.default)
@@ -41,11 +47,32 @@ local function initLeafDefaults(instance, prefix, fields)
 	end
 end
 
+-- Reads <prefix>_Count and <prefix>_1..N into a real Luau array. Per-
+-- element value depends on the element's type — composites yield a
+-- proxy at the deeper prefix, instances resolve through the registry,
+-- primitives/enums are the attribute value verbatim.
+local makeCompositeProxy -- forward decl; populated below.
+local function buildListArray(instance, prefix, elementDef)
+	local count = instance:GetAttribute(prefix .. "_Count") or 0
+	local arr = {}
+	for i = 1, count do
+		local itemPrefix = prefix .. "_" .. i
+		if elementDef.type == "composite" then
+			arr[i] = makeCompositeProxy(instance, itemPrefix, elementDef.fields)
+		elseif elementDef.type == "instance" then
+			arr[i] = InstanceRegistry.resolve(instance:GetAttribute(itemPrefix))
+		else
+			arr[i] = instance:GetAttribute(itemPrefix)
+		end
+	end
+	return arr
+end
+
 -- Returns a proxy table whose reads/writes route to flat-named
 -- attributes under `prefix`. Nested composites yield deeper proxies on
 -- demand. Replacing a composite (proxy[k] = newComposite) batch-writes
 -- each leaf from `v[subName]`.
-local function makeCompositeProxy(instance, prefix, fields)
+function makeCompositeProxy(instance, prefix, fields)
 	return setmetatable({}, {
 		__index = function(_, k)
 			local fieldDef = fields[k]
@@ -123,6 +150,20 @@ function Component.spawn(definition, instance)
 
 		if fieldDef.type == "composite" then
 			serialized[fieldName] = makeCompositeProxy(instance, attrName, fieldDef.fields)
+		elseif fieldDef.type == "list" then
+			-- A list is exposed as a real Luau array (rebuilt from
+			-- storage). table.insert / table.remove from C# user code
+			-- mutate the array directly and are runtime-only — to
+			-- persist, edit via the inspector or set the attributes
+			-- yourself.
+			serialized[fieldName] = buildListArray(instance, attrName, fieldDef.element)
+			local listPrefix = attrName .. "_"
+			local conn = instance.AttributeChanged:Connect(function(name)
+				if string.sub(name, 1, #listPrefix) == listPrefix then
+					serialized[fieldName] = buildListArray(instance, attrName, fieldDef.element)
+				end
+			end)
+			table.insert(connections, conn)
 		elseif fieldDef.type == "instance" then
 			serialized[fieldName] = InstanceRegistry.resolve(instance:GetAttribute(attrName))
 			local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
@@ -174,6 +215,11 @@ function Component.spawn(definition, instance)
 					for subName in pairs(fieldDef.fields) do
 						proxy[subName] = v[subName]
 					end
+				elseif fieldDef.type == "list" then
+					-- List assignment is runtime-only (Unity-like). The
+					-- cache holds the new array; storage is untouched.
+					-- Use the inspector to persist.
+					rawget(t, "_serialized")[k] = v
 				else
 					t.Instance:SetAttribute(attrName, v)
 				end

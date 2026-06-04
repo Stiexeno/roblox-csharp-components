@@ -761,6 +761,169 @@ end
 
 registerDrawer("enum", createEnumEditor)
 
+-- Walks a list element's shape, calling `cb(relPath)` once per leaf
+-- attribute under the element. For a primitive/instance/enum element
+-- the only leaf is "" (the element's own prefix); composite elements
+-- recurse through their fields.
+local function forEachLeafRelPath(elementDef, accPath, cb)
+	if elementDef.type == "composite" then
+		for fieldName, fieldDef in pairs(elementDef.fields) do
+			forEachLeafRelPath(fieldDef, accPath .. "_" .. fieldName, cb)
+		end
+	else
+		cb(accPath)
+	end
+end
+
+local function initElementDefaults(instance, prefix, elementDef)
+	if elementDef.type == "composite" then
+		for fieldName, fieldDef in pairs(elementDef.fields) do
+			initElementDefaults(instance, prefix .. "_" .. fieldName, fieldDef)
+		end
+	else
+		instance:SetAttribute(prefix, elementDef.default)
+	end
+end
+
+-- List drawer: foldout header with "+", per-element row delegated to
+-- the element type's own drawer, plus a "×" button overlaid per element
+-- for removal. Removal shifts later elements down and clears the now-
+-- orphan last slot. Add appends with defaults.
+local function createListEditor(parent, fieldName, instance, attrName, _rowIndex, fieldDef, depth)
+	depth = depth or 0
+	local labelX = 14 + depth * 14
+	local elementDef = fieldDef.element
+
+	local key = attrName
+	local expanded = compositeExpanded[key]
+	if expanded == nil then expanded = false end
+
+	local count = instance:GetAttribute(attrName .. "_Count") or 0
+
+	local header = Instance.new("TextButton")
+	header.BackgroundColor3 = ROW_COLOR
+	header.BorderSizePixel = 0
+	header.Text = ""
+	header.AutoButtonColor = false
+	header.Size = UDim2.new(1, 0, 0, 24)
+	header.Parent = parent
+
+	header.MouseEnter:Connect(function() header.BackgroundColor3 = ROW_HOVER_COLOR end)
+	header.MouseLeave:Connect(function() header.BackgroundColor3 = ROW_COLOR end)
+
+	makeLabel({
+		parent = header,
+		text = expanded and "▾" or "▸",
+		color = color("MainText"),
+		size = 14,
+		frameSize = UDim2.new(0, 14, 1, 0),
+		position = UDim2.new(0, labelX - 8, 0, 0),
+	})
+	makeLabel({
+		parent = header,
+		text = fieldName .. "  [" .. count .. "]",
+		color = color("MainText"),
+		font = Enum.Font.SourceSansSemibold,
+		frameSize = UDim2.new(1, -labelX - 40, 1, 0),
+		position = UDim2.new(0, labelX + 8, 0, 0),
+	})
+
+	local addBtn = Instance.new("TextButton")
+	addBtn.BackgroundColor3 = HEADER_COLOR
+	addBtn.BorderSizePixel = 0
+	addBtn.Text = "+"
+	addBtn.TextColor3 = color("MainText")
+	addBtn.Font = Enum.Font.SourceSansBold
+	addBtn.TextSize = 16
+	addBtn.Size = UDim2.new(0, 22, 0, 18)
+	addBtn.Position = UDim2.new(1, -28, 0.5, -9)
+	addBtn.AutoButtonColor = true
+	addBtn.Parent = header
+	roundCorners(addBtn, 4)
+
+	addBtn.MouseButton1Click:Connect(function()
+		local newCount = count + 1
+		initElementDefaults(instance, attrName .. "_" .. newCount, elementDef)
+		instance:SetAttribute(attrName .. "_Count", newCount)
+		refresh()
+	end)
+
+	header.MouseButton1Click:Connect(function()
+		compositeExpanded[key] = not expanded
+		refresh()
+	end)
+
+	if not expanded or count == 0 then
+		return function() end
+	end
+
+	local cleanups = {}
+	for i = 1, count do
+		-- Per-element slot: contains the element drawer's row(s) plus
+		-- an overlaid remove button. UIPadding on the right reserves
+		-- space so the remove button doesn't overlap the value column.
+		local slot = Instance.new("Frame")
+		slot.BackgroundTransparency = 1
+		slot.Size = UDim2.new(1, 0, 0, 24)
+		slot.AutomaticSize = Enum.AutomaticSize.Y
+		slot.Parent = parent
+
+		local slotLayout = Instance.new("UIListLayout")
+		slotLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		slotLayout.Parent = slot
+
+		local slotPad = Instance.new("UIPadding")
+		slotPad.PaddingRight = UDim.new(0, 28)
+		slotPad.Parent = slot
+
+		local elementDrawer = resolveDrawer(elementDef)
+		if elementDrawer then
+			table.insert(cleanups,
+				elementDrawer(slot, tostring(i), instance,
+					attrName .. "_" .. i, i, elementDef, depth + 1))
+		end
+
+		local removeBtn = Instance.new("TextButton")
+		removeBtn.BackgroundColor3 = HEADER_COLOR
+		removeBtn.BorderSizePixel = 0
+		removeBtn.Text = "×"
+		removeBtn.TextColor3 = color("DimmedText")
+		removeBtn.Font = Enum.Font.SourceSansBold
+		removeBtn.TextSize = 16
+		removeBtn.Size = UDim2.new(0, 20, 0, 18)
+		removeBtn.Position = UDim2.new(1, -24, 0, 3)
+		removeBtn.AutoButtonColor = true
+		removeBtn.ZIndex = 5
+		removeBtn.Parent = slot
+		roundCorners(removeBtn, 4)
+
+		local idx = i
+		removeBtn.MouseButton1Click:Connect(function()
+			local last = count
+			for j = idx, last - 1 do
+				forEachLeafRelPath(elementDef, "", function(relPath)
+					local from = attrName .. "_" .. (j + 1) .. relPath
+					local to = attrName .. "_" .. j .. relPath
+					instance:SetAttribute(to, instance:GetAttribute(from))
+				end)
+			end
+			forEachLeafRelPath(elementDef, "", function(relPath)
+				instance:SetAttribute(attrName .. "_" .. last .. relPath, nil)
+			end)
+			instance:SetAttribute(attrName .. "_Count", last - 1)
+			refresh()
+		end)
+	end
+
+	return function()
+		for _, fn in ipairs(cleanups) do
+			pcall(fn)
+		end
+	end
+end
+
+registerDrawer("list", createListEditor)
+
 ----------------------------------------------------------------------
 -- Component section
 --

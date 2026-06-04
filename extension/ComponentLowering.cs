@@ -192,6 +192,20 @@ namespace RobloxCSharp.Extensions.Components
 			{
 				CompositeLowering.EmitEnumEntry(state, enumName, enumValues, initializer, inner);
 			}
+			else if (CompositeLowering.TryGetListElementType(type, out ITypeSymbol elementType))
+			{
+				if (CompositeLowering.TryGetListElementType(elementType, out _))
+				{
+					throw new InvalidOperationException(
+						$"[SerializedField] '{memberName}' is a nested list. " +
+						"Nested lists (List<List<X>>) aren't supported yet.");
+				}
+				LuaTableExpression elementEntry = LuaFactory.Table(inline: true);
+				CompositeLowering.BuildElementEntry(state, elementType, memberName, elementEntry);
+				AddKV(inner, "type", LuaFactory.LiteralExpression("list"));
+				AddKV(inner, "element", elementEntry);
+				AddKV(inner, "default", LuaFactory.LiteralExpression(0));
+			}
 			else if (CompositeLowering.IsCompositeCandidate(type))
 			{
 				LuaTableExpression nested = LuaFactory.Table(inline: false);

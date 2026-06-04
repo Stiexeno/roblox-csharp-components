@@ -32,6 +32,29 @@ namespace RobloxCSharp.Extensions.Components
 			return true;
 		}
 
+		// True for List<T> and T[]. Other list-shaped types (HashSet, Queue,
+		// IList, IReadOnlyList, ...) aren't supported as SerializedFields
+		// — only ordered, indexable List<T> matches the inspector's add /
+		// remove + numbered-row UX.
+		public static bool TryGetListElementType(ITypeSymbol type, out ITypeSymbol elementType)
+		{
+			if (type is IArrayTypeSymbol arr)
+			{
+				elementType = arr.ElementType;
+				return true;
+			}
+			if (type is INamedTypeSymbol named
+				&& named.Name == "List"
+				&& named.IsGenericType
+				&& named.TypeArguments.Length == 1)
+			{
+				elementType = named.TypeArguments[0];
+				return true;
+			}
+			elementType = null;
+			return false;
+		}
+
 		public static bool TryGetInstanceConstraint(ITypeSymbol type, out string constraint)
 		{
 			constraint = null;
@@ -188,6 +211,20 @@ namespace RobloxCSharp.Extensions.Components
 			visited.Remove(type);
 		}
 
+		// Public wrapper used by ComponentLowering when building a top-
+		// level list's element entry. Always starts with a fresh visited
+		// set since the element is its own subtree.
+		public static void BuildElementEntry(
+			TransformerState state,
+			ITypeSymbol type,
+			string path,
+			LuaTableExpression entry)
+		{
+			BuildEntry(state, type,
+				new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default),
+				path, null, entry);
+		}
+
 		private static void BuildEntry(
 			TransformerState state,
 			ITypeSymbol type,
@@ -207,6 +244,22 @@ namespace RobloxCSharp.Extensions.Components
 			if (TryGetEnumValues(type, out string enumName, out List<(string, int)> enumValues))
 			{
 				EmitEnumEntry(state, enumName, enumValues, initializer, entry);
+				return;
+			}
+
+			if (TryGetListElementType(type, out ITypeSymbol elementType))
+			{
+				if (TryGetListElementType(elementType, out _))
+				{
+					throw new InvalidOperationException(
+						$"[SerializedField] '{path}' is a nested list. " +
+						"Nested lists (List<List<X>>) aren't supported yet.");
+				}
+				LuaTableExpression elementEntry = LuaFactory.Table(inline: true);
+				BuildEntry(state, elementType, visited, $"{path}[]", null, elementEntry);
+				AddKV(entry, "type", LuaFactory.LiteralExpression("list"));
+				AddKV(entry, "element", elementEntry);
+				AddKV(entry, "default", LuaFactory.LiteralExpression(0));
 				return;
 			}
 
