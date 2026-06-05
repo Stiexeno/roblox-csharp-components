@@ -147,6 +147,31 @@ local function loadDefinitions()
 	return defs
 end
 
+-- Re-fires `refresh` whenever a Component definition's source changes
+-- or a new ModuleScript appears / disappears under any discovery root.
+-- Without this, editing a [SerializedField] in C# + recompiling would
+-- leave the inspector showing stale fields until the user re-selected
+-- the part. All listeners land on `tasks` and get disconnected on the
+-- next rebuild's runCleanup.
+local function wireSchemaWatchers(tasks)
+	for _, root in ipairs(discoveryRoots()) do
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if descendant:IsA("ModuleScript") and looksLikeComponentSource(descendant) then
+				local conn = descendant:GetPropertyChangedSignal("Source"):Connect(refresh)
+				table.insert(tasks, function() conn:Disconnect() end)
+			end
+		end
+		local addConn = root.DescendantAdded:Connect(function(d)
+			if d:IsA("ModuleScript") then refresh() end
+		end)
+		local rmConn = root.DescendantRemoving:Connect(function(d)
+			if d:IsA("ModuleScript") then refresh() end
+		end)
+		table.insert(tasks, function() addConn:Disconnect() end)
+		table.insert(tasks, function() rmConn:Disconnect() end)
+	end
+end
+
 ----------------------------------------------------------------------
 -- UI factory helpers
 --
@@ -1700,6 +1725,7 @@ local function build()
 	-- project doesn't have any `: Component` subclasses yet.
 	loadCustomDrawers()
 	local defs = loadDefinitions()
+	wireSchemaWatchers(cleanupTasks)
 	if not next(defs) then
 		makeLabel({
 			parent = scroll,
