@@ -60,6 +60,13 @@ local compositeExpanded = {}
 -- the nil at definition time.
 local refresh
 
+-- Forward declaration. Assigned once `plugin:CreateDockWidgetPluginGui`
+-- runs near the bottom. UI builders defined further up (e.g.
+-- createEnumEditor's openDropdown) close over this name so dropdowns
+-- can parent themselves to the dock widget and position relative to
+-- its AbsolutePosition.
+local widget
+
 -- Currently-armed instance picker, or nil. While non-nil, the next
 -- selection that satisfies the constraint is treated as the pick
 -- (not as a normal "show the selection's components" rebuild).
@@ -1297,7 +1304,6 @@ end
 -- Top-level render
 ----------------------------------------------------------------------
 
-local widget
 local cleanupTasks = {}
 
 local function runCleanup()
