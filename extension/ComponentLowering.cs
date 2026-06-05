@@ -228,7 +228,7 @@ namespace RobloxCSharp.Extensions.Components
 			{
 				throw new InvalidOperationException(
 					$"[SerializedField] '{memberName}' has unsupported type '{typeSyntax}'. " +
-					"Supported: int / long / float / double / string / bool, Instance subclass, or a plain class of those.");
+					"Supported: int / long / float / double / string / bool / Vector3 / Color3, Instance subclass, or a plain class of those.");
 			}
 
 			outer.Elements.Add(LuaFactory.ExpressionStatement(

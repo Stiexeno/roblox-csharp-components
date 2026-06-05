@@ -419,6 +419,150 @@ local function createBooleanEditor(parent, fieldName, instance, attrName, rowInd
 	return function() conn:Disconnect() end
 end
 
+-- Shared helper for Vector3/Color3 multi-component editors. Builds a
+-- horizontal row of [label, transparent textbox] pairs inside the
+-- value slot; each pair invokes `onCommit(axisIndex, newNumber)` on
+-- FocusLost. Returns a `paint(values)` closure the caller invokes
+-- whenever the stored value changes so the textboxes reflect it.
+local function makeAxisRow(slot, axes)
+	local row = Instance.new("Frame")
+	row.BackgroundTransparency = 1
+	row.Size = UDim2.fromScale(1, 1)
+	row.Parent = slot
+
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.VerticalAlignment = Enum.VerticalAlignment.Center
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = row
+
+	local boxes = {}
+	for i, axis in ipairs(axes) do
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Text = axis
+		label.TextColor3 = color("DimmedText")
+		label.Font = Enum.Font.SourceSans
+		label.TextSize = 14
+		label.TextXAlignment = Enum.TextXAlignment.Center
+		label.Size = UDim2.fromOffset(10, 22)
+		label.LayoutOrder = i * 2 - 1
+		label.Parent = row
+
+		local box = Instance.new("TextBox")
+		box.BackgroundTransparency = 1
+		box.BorderSizePixel = 0
+		box.Text = ""
+		box.TextColor3 = color("MainText")
+		box.PlaceholderColor3 = color("DimmedText")
+		box.Font = Enum.Font.SourceSans
+		box.TextSize = 14
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.TextYAlignment = Enum.TextYAlignment.Center
+		box.ClearTextOnFocus = false
+		box.Size = UDim2.new(1 / #axes, -14, 1, 0)
+		box.LayoutOrder = i * 2
+		box.Parent = row
+
+		boxes[i] = box
+	end
+
+	return boxes
+end
+
+local function createVector3Editor(parent, fieldName, instance, attrName, rowIndex, _fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
+	local boxes = makeAxisRow(slot, { "X", "Y", "Z" })
+
+	local function paint()
+		local v = instance:GetAttribute(attrName)
+		if typeof(v) ~= "Vector3" then v = Vector3.zero end
+		for i, axisValue in ipairs({ v.X, v.Y, v.Z }) do
+			if not boxes[i]:IsFocused() then
+				boxes[i].Text = tostring(axisValue)
+			end
+		end
+	end
+	paint()
+
+	local function commit()
+		local x = tonumber(boxes[1].Text) or 0
+		local y = tonumber(boxes[2].Text) or 0
+		local z = tonumber(boxes[3].Text) or 0
+		recordChange("Set " .. fieldName, function()
+			instance:SetAttribute(attrName, Vector3.new(x, y, z))
+		end)
+	end
+
+	for _, box in ipairs(boxes) do
+		box.FocusLost:Connect(commit)
+	end
+	local conn = instance:GetAttributeChangedSignal(attrName):Connect(paint)
+	return function() conn:Disconnect() end
+end
+
+-- Color3 stored as a native Color3 attribute. Editor shows a small
+-- swatch at the left of the value slot then a single hex textbox
+-- (#RRGGBB) on the right — matches the way Studio's color picker
+-- summarises a Color3 and lines up with most designers' workflow.
+local function colorToHex(c)
+	return string.format("#%02X%02X%02X",
+		math.clamp(math.floor(c.R * 255 + 0.5), 0, 255),
+		math.clamp(math.floor(c.G * 255 + 0.5), 0, 255),
+		math.clamp(math.floor(c.B * 255 + 0.5), 0, 255))
+end
+
+local function createColor3Editor(parent, fieldName, instance, attrName, rowIndex, _fieldDef, depth)
+	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
+
+	local swatch = Instance.new("Frame")
+	swatch.BorderSizePixel = 0
+	swatch.AnchorPoint = Vector2.new(0, 0.5)
+	swatch.Position = UDim2.new(0, 0, 0.5, 0)
+	swatch.Size = UDim2.fromOffset(16, 16)
+	swatch.Parent = slot
+	roundCorners(swatch, 3)
+
+	local box = Instance.new("TextBox")
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Text = ""
+	box.TextColor3 = color("MainText")
+	box.PlaceholderColor3 = color("DimmedText")
+	box.Font = Enum.Font.SourceSans
+	box.TextSize = 14
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.TextYAlignment = Enum.TextYAlignment.Center
+	box.ClearTextOnFocus = false
+	box.Position = UDim2.fromOffset(20, 0)
+	box.Size = UDim2.new(1, -20, 1, 0)
+	box.Parent = slot
+
+	local function paint()
+		local c = instance:GetAttribute(attrName)
+		if typeof(c) ~= "Color3" then c = Color3.new() end
+		swatch.BackgroundColor3 = c
+		if not box:IsFocused() then
+			box.Text = colorToHex(c)
+		end
+	end
+	paint()
+
+	box.FocusLost:Connect(function()
+		local ok, c = pcall(Color3.fromHex, box.Text)
+		if ok and typeof(c) == "Color3" then
+			recordChange("Set " .. fieldName, function()
+				instance:SetAttribute(attrName, c)
+			end)
+		else
+			paint() -- snap back to last good value
+		end
+	end)
+	local conn = instance:GetAttributeChangedSignal(attrName):Connect(paint)
+	return function() conn:Disconnect() end
+end
+
 -- Instance-ref helpers. Mirror runtime/InstanceRegistry.luau but
 -- scoped to the plugin so edit-time picks don't depend on the runtime
 -- service being booted. The "_uid" attribute is the same on-Instance
@@ -615,6 +759,8 @@ end
 registerDrawer("number", createNumberEditor)
 registerDrawer("string", createStringEditor)
 registerDrawer("boolean", createBooleanEditor)
+registerDrawer("vector3", createVector3Editor)
+registerDrawer("color3", createColor3Editor)
 registerDrawer("instance", createInstanceEditor)
 
 -- Scans user code roots for ModuleScripts shaped like:

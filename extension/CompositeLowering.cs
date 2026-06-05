@@ -29,6 +29,12 @@ namespace RobloxCSharp.Extensions.Components
 			if (type is INamedTypeSymbol n && n.IsGenericType) return false;
 			if (IsInstanceDerived(type)) return false;
 			if (IsComponentDerived(type)) return false;
+			// Roblox data types (Vector3, Color3, CFrame, ...) live under
+			// RobloxApiNamespace and are NOT composites — they should be
+			// matched by TryMapPrimitive (or fall through as unsupported).
+			// Without this guard they get a class-shape match and emit as
+			// empty composites because they have no SerializedFields.
+			if (type.ContainingNamespace?.ToDisplayString() == RobloxApiNamespace) return false;
 			return true;
 		}
 
@@ -84,6 +90,15 @@ namespace RobloxCSharp.Extensions.Components
 				case SpecialType.System_Boolean:
 					luaType = "boolean"; return true;
 			}
+			if (type is not null
+				&& type.ContainingNamespace?.ToDisplayString() == RobloxApiNamespace)
+			{
+				switch (type.Name)
+				{
+					case "Vector3": luaType = "vector3"; return true;
+					case "Color3":  luaType = "color3";  return true;
+				}
+			}
 			luaType = null;
 			return false;
 		}
@@ -93,6 +108,8 @@ namespace RobloxCSharp.Extensions.Components
 			"number"  => LuaFactory.LiteralExpression(0),
 			"string"  => LuaFactory.LiteralExpression(""),
 			"boolean" => LuaFactory.LiteralExpression(false),
+			"vector3" => LuaFactory.Invocation(LuaFactory.MemberAccess(LuaFactory.Identifier("Vector3"), "new")),
+			"color3"  => LuaFactory.Invocation(LuaFactory.MemberAccess(LuaFactory.Identifier("Color3"), "new")),
 			_         => LuaFactory.LiteralExpression(null),
 		};
 
