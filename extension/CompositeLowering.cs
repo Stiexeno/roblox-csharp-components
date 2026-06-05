@@ -325,5 +325,20 @@ namespace RobloxCSharp.Extensions.Components
 			}
 			return false;
 		}
+
+		// True when `type` derives from Components.Component but isn't the
+		// base Component itself. `componentName` is the user's subclass
+		// name, which the runtime uses to look up the live component on a
+		// referenced Instance via ComponentsService:GetComponent.
+		public static bool TryGetComponentConstraint(ITypeSymbol type, out string componentName)
+		{
+			componentName = null;
+			if (type is null) return false;
+			if (type.Name == ComponentTypeName
+				&& type.ContainingNamespace?.Name == ComponentNamespace) return false;
+			if (!IsComponentDerived(type)) return false;
+			componentName = type.Name;
+			return true;
+		}
 	}
 }

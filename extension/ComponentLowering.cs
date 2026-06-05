@@ -187,6 +187,12 @@ namespace RobloxCSharp.Extensions.Components
 				AddKV(inner, "constraint", LuaFactory.LiteralExpression(constraint));
 				AddKV(inner, "default", LuaFactory.LiteralExpression(""));
 			}
+			else if (CompositeLowering.TryGetComponentConstraint(type, out string componentName))
+			{
+				AddKV(inner, "type", LuaFactory.LiteralExpression("component"));
+				AddKV(inner, "constraint", LuaFactory.LiteralExpression(componentName));
+				AddKV(inner, "default", LuaFactory.LiteralExpression(""));
+			}
 			else if (CompositeLowering.TryGetEnumValues(type, out string enumName,
 				out List<(string, int)> enumValues))
 			{

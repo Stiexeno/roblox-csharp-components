@@ -25,6 +25,17 @@ local InstanceRegistry = require(script.Parent.InstanceRegistry)
 local Component = {}
 Component.__index = Component
 
+-- Set by ComponentsService.constructor so component-typed serialized
+-- fields (`[SerializedField] Health target`) can resolve the live
+-- component table from the referenced Instance + component name.
+-- Module-level slot dodges a cyclic require between Component and
+-- ComponentsService.
+local _componentsService = nil
+
+function Component.setComponentsService(svc)
+	_componentsService = svc
+end
+
 -- Recursively writes the default for every leaf attribute under `prefix`
 -- that isn't already set. Composite fields don't have an attribute of
 -- their own — only their leaves do. Lists get an empty Count;
@@ -170,6 +181,11 @@ function Component.spawn(definition, instance)
 				serialized[fieldName] = InstanceRegistry.resolve(instance:GetAttribute(attrName))
 			end)
 			table.insert(connections, conn)
+		elseif fieldDef.type == "component" then
+			-- Resolved live on read via __index — see below. The cached
+			-- slot stays nil because the referenced component may spawn
+			-- after this one (declaration order isn't dependency order).
+			serialized[fieldName] = nil
 		else
 			serialized[fieldName] = instance:GetAttribute(attrName)
 			local conn = instance:GetAttributeChangedSignal(attrName):Connect(function()
@@ -196,9 +212,20 @@ function Component.spawn(definition, instance)
 	-- this is the single source of truth). Otherwise rawset.
 	return setmetatable(self, {
 		__index = function(t, k)
+			local def = rawget(t, "_definition")
+			local fieldDef = def.SerializedFields and def.SerializedFields[k]
+			-- Component-typed fields resolve live: the referenced
+			-- component might spawn after this one, so caching at spawn
+			-- time would return stale nils forever.
+			if fieldDef and fieldDef.type == "component" then
+				local uid = rawget(t, "Instance"):GetAttribute(Component.attrFor(def.ComponentName, k))
+				local target = InstanceRegistry.resolve(uid)
+				if not target or not _componentsService then return nil end
+				return _componentsService:GetComponent(target, fieldDef.constraint)
+			end
 			local s = rawget(t, "_serialized")
 			if s[k] ~= nil then return s[k] end
-			return rawget(t, "_definition")[k]
+			return def[k]
 		end,
 		__newindex = function(t, k, v)
 			local def = rawget(t, "_definition")
@@ -207,6 +234,13 @@ function Component.spawn(definition, instance)
 				local attrName = Component.attrFor(def.ComponentName, k)
 				if fieldDef.type == "instance" then
 					local uid = v and InstanceRegistry.bind(v) or ""
+					t.Instance:SetAttribute(attrName, uid)
+				elseif fieldDef.type == "component" then
+					-- Accept either a sibling component table (use its
+					-- .Instance) or a bare Instance — both round-trip
+					-- through the same uid storage.
+					local inst = v and (typeof(v) == "Instance" and v or v.Instance)
+					local uid = inst and InstanceRegistry.bind(inst) or ""
 					t.Instance:SetAttribute(attrName, uid)
 				elseif fieldDef.type == "composite" then
 					-- Whole-composite replace: route each leaf through

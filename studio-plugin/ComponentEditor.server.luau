@@ -625,6 +625,10 @@ end
 local function createInstanceEditor(parent, fieldName, instance, attrName, rowIndex, fieldDef, depth)
 	local _, slot = buildFieldRow(parent, fieldName, rowIndex, depth)
 	local constraint = fieldDef.constraint or "Instance"
+	-- "instance" picks any Instance whose ClassName IsA(constraint).
+	-- "component" picks an Instance carrying the Component:<constraint>
+	-- tag (validated in the SelectionChanged handler).
+	local pickerKind = fieldDef.type == "component" and "component" or "instance"
 
 	-- Class icon left of the name, sourced from Studio's own Explorer
 	-- iconography via StudioService:GetClassIcon — Part shows the Part
@@ -738,6 +742,7 @@ local function createInstanceEditor(parent, fieldName, instance, attrName, rowIn
 			ownerInstance = instance,
 			attrName = attrName,
 			constraint = constraint,
+			kind = pickerKind,
 			button = pick,
 			label = display,
 		}
@@ -787,6 +792,7 @@ registerDrawer("boolean", createBooleanEditor)
 registerDrawer("vector3", createVector3Editor)
 registerDrawer("color3", createColor3Editor)
 registerDrawer("instance", createInstanceEditor)
+registerDrawer("component", createInstanceEditor)
 
 -- Scans user code roots for ModuleScripts shaped like:
 --   return { DrawerFor = "<key>", Draw = function(...) ... end }
@@ -1818,7 +1824,15 @@ Selection.SelectionChanged:Connect(function()
 	if armedPicker then
 		local picked = Selection:Get()[1]
 		local p = armedPicker
-		if picked and picked ~= p.ownerInstance and picked:IsA(p.constraint) then
+		local matches = false
+		if picked and picked ~= p.ownerInstance then
+			if p.kind == "component" then
+				matches = CollectionService:HasTag(picked, TAG_PREFIX .. p.constraint)
+			else
+				matches = picked:IsA(p.constraint)
+			end
+		end
+		if matches then
 			recordChange("Pick " .. picked.Name, function()
 				local uid = bindUid(picked)
 				p.ownerInstance:SetAttribute(p.attrName, uid)

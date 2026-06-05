@@ -39,6 +39,11 @@ function ComponentsService:constructor(container)
 	self._active = {}      -- [Instance][componentName] = live component.
 	self._connections = {} -- Disconnectables collected for OnDestroy.
 
+	-- Hand ourselves to the Component module so component-typed
+	-- serialized fields (`[SerializedField] Health target`) can
+	-- resolve back through GetComponent at read time.
+	Component.setComponentsService(self)
+
 	-- Backfill the Instance registry so [SerializedField] reference
 	-- fields can resolve before the first component spawns.
 	InstanceRegistry.scan(Workspace)
@@ -59,6 +64,16 @@ function ComponentsService:constructor(container)
 			self:_tick("LateUpdate", dt)
 		end))
 	end
+end
+
+-- Looks up the live component table attached to `instance` for the
+-- given component name. Returns nil if `instance` has no such
+-- component (yet — components may attach in any order during boot).
+-- Backs the runtime resolution of `[SerializedField] <Component>`
+-- references and is the public equivalent of Unity's GetComponent<T>.
+function ComponentsService:GetComponent(instance, componentName)
+	local byName = self._active[instance]
+	return byName and byName[componentName] or nil
 end
 
 -- Public entry point called by the compiler-emitted installer tail.
