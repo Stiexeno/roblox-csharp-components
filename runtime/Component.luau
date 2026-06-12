@@ -36,6 +36,12 @@ function Component.setComponentsService(svc)
 	_componentsService = svc
 end
 
+-- Live component index: [Instance] = { [componentName] = component }.
+-- Maintained by spawn/destroy so the GetComponent family can look up
+-- siblings from any component without a service reference. Weak keys
+-- are a backstop only — destroy() removes entries explicitly.
+local activeByInstance = setmetatable({}, { __mode = "k" })
+
 -- Recursively writes the default for every leaf attribute under `prefix`
 -- that isn't already set. Composite fields don't have an attribute of
 -- their own — only their leaves do. Lists get an empty Count;
@@ -91,6 +97,10 @@ function makeCompositeProxy(instance, prefix, fields)
 			local attrName = prefix .. "_" .. k
 			if fieldDef.type == "composite" then
 				return makeCompositeProxy(instance, attrName, fieldDef.fields)
+			elseif fieldDef.type == "list" then
+				-- Same read path as a top-level list field: rebuild the
+				-- array from <attr>_Count + <attr>_1..N on each access.
+				return buildListArray(instance, attrName, fieldDef.element)
 			elseif fieldDef.type == "instance" then
 				return InstanceRegistry.resolve(instance:GetAttribute(attrName))
 			else
@@ -106,6 +116,13 @@ function makeCompositeProxy(instance, prefix, fields)
 				for subName in pairs(fieldDef.fields) do
 					sub[subName] = v[subName]
 				end
+			elseif fieldDef.type == "list" then
+				-- Proxies don't cache, so there is no runtime-only array
+				-- to swap (the top-level list write path's behaviour).
+				-- Persist nested-list edits via the inspector / attributes.
+				warn(string.format(
+					"[Components] Assigning to nested list '%s' is not supported — edit the attributes or use the inspector.",
+					attrName))
 			elseif fieldDef.type == "instance" then
 				local uid = v and InstanceRegistry.bind(v) or ""
 				instance:SetAttribute(attrName, uid)
@@ -210,7 +227,7 @@ function Component.spawn(definition, instance)
 	-- On write: if the key is a serialized field, push to the attribute
 	-- (which fires the change signal, which updates _serialized — so
 	-- this is the single source of truth). Otherwise rawset.
-	return setmetatable(self, {
+	local component = setmetatable(self, {
 		__index = function(t, k)
 			local def = rawget(t, "_definition")
 			local fieldDef = def.SerializedFields and def.SerializedFields[k]
@@ -262,6 +279,40 @@ function Component.spawn(definition, instance)
 			end
 		end,
 	})
+
+	local byName = activeByInstance[instance]
+	if not byName then
+		byName = {}
+		activeByInstance[instance] = byName
+	end
+	byName[definition.ComponentName] = component
+
+	return component
+end
+
+-- Sibling lookup. `GetComponent<T>()` lowers to `GetComponent(T)` — the
+-- definition table arrives as the argument. Returns the live component
+-- of that type on the same Instance, or nil.
+function Component:GetComponent(definition)
+	local byName = activeByInstance[self.Instance]
+	return byName and byName[definition.ComponentName] or nil
+end
+
+-- Identical lookup; kept as a separate name so the C# surface reads
+-- like Unity's. (The Unity out-param shape doesn't lower to Luau, so
+-- the stub returns T-or-null instead.)
+function Component:TryGetComponent(definition)
+	return self:GetComponent(definition)
+end
+
+function Component:GetRequiredComponent(definition)
+	local found = self:GetComponent(definition)
+	if found == nil then
+		error(string.format(
+			"[Components] GetRequiredComponent: no %s component on %s",
+			definition.ComponentName, self.Instance:GetFullName()), 2)
+	end
+	return found
 end
 
 -- Tears down a component instance. Disconnects attribute listeners and
@@ -278,6 +329,14 @@ function Component.destroy(component)
 	end
 	for _, conn in ipairs(component._connections) do
 		conn:Disconnect()
+	end
+
+	local byName = activeByInstance[component.Instance]
+	if byName then
+		byName[component._definition.ComponentName] = nil
+		if next(byName) == nil then
+			activeByInstance[component.Instance] = nil
+		end
 	end
 end
 

@@ -1,20 +1,16 @@
 # roblox-csharp-components
 
-Unity-style component system for [roblox-csharp](https://github.com/Stiexeno/roblox-csharp). Write `Health : Component` in C#, tag a Roblox Instance, and the runtime spawns the component with DI-resolved dependencies — no manual registration, no boilerplate in your installer.
+Unity-style component system for [roblox-csharp](https://github.com/Stiexeno/roblox-csharp): write `Health : Component` in C#, tag an Instance with `Component:Health`, and the runtime spawns it with DI-resolved constructor dependencies.
 
 ## Install
-
-Requires the [DependencyInjection](https://github.com/Stiexeno/roblox-csharp-dependency-injection) plugin (every project that uses Components has an Installer; the auto-registration tail relies on it).
 
 ```sh
 roblox-csharp plugin add Stiexeno/roblox-csharp-components
 ```
 
-That clones into `plugins/Components/`. The compiler picks it up automatically on the next build.
+Requires the [DependencyInjection](https://github.com/Stiexeno/roblox-csharp-dependency-injection) plugin — auto-registration is emitted as a tail on your project's `Installer`, so a `[Server]`/`[Client]` Installer subclass must exist or components silently never register.
 
-## Quick start
-
-### 1. Write a component
+## Usage
 
 ```csharp
 using Components;
@@ -22,111 +18,62 @@ using Components;
 public class Health : Component
 {
     [SerializedField] private int max = 100;
-    [SerializedField] private int current = 100;
+    [SerializedField] private BasePart hitbox;       // Instance ref (GUID-backed)
+    [SerializedField] private Vector3 offset;        // Vector3 / Color3 attributes
+    [SerializedField] private Shield shield;         // Component ref (resolved live)
+    [SerializedField] private MoveState state;       // enum (stored as int)
+    [SerializedField] private KnockbackInfo knock;   // plain class → composite (flattened leaves)
+    [SerializedField] private List<int> thresholds;  // list / array
 
-    protected override void Awake()
-    {
-        // Runs once when the component attaches to its Instance.
-        // self.Instance is the Roblox Instance.
-    }
+    public Health(IGameEvents events) { }  // resolved from your installer's container
 
-    protected override void Update(float dt)
-    {
-        if (current <= 0) Instance.Destroy();
-    }
-
-    public void TakeDamage(int amount)
-    {
-        current = Math.Max(0, current - amount);
-    }
+    protected override void Awake() { }            // on spawn; Instance is set
+    protected override void Start() { }            // next frame after every sibling's Awake
+    protected override void Update(float dt) { }   // Heartbeat, server + client
+    protected override void LateUpdate(float dt) { } // RenderStepped, client only
+    protected override void OnDestroy() { }        // tag removed / Instance destroyed
 }
 ```
 
-That's the whole authoring surface. No `[Component]` attribute. No Register call. No binding in the installer.
+No Register call, no installer boilerplate. Tag via Studio's Tag Editor, the inspector below, or `CollectionService:AddTag`.
 
-### 2. Tag a Roblox Instance
+Tagged instances under `ServerStorage` / `ReplicatedStorage` are treated as templates and never spawn; a clone (or reparent) into the live DataModel spawns normally.
 
-Add the tag `Component:Health` to any Instance via Studio's Tag Editor (or `CollectionService:AddTag(part, "Component:Health")`). The compiler-generated installer tail registers the watcher; the runtime spawns a `Health` instance the moment the tag appears.
+### Context
 
-### 3. (Optional) DI-injected dependencies
+Components register into the DI installer matching their own module's Rojo context: server components into the `[Server]` installer, client components into the `[Client]` one. Shared components (ReplicatedStorage modules) register **server-side only** — registering both sides would double-spawn every Workspace instance; put the source in a client context if you want client behavior. A component that matches no installer (or a project with no installer at all) gets an RC0021 warning at compile time.
 
-Components are constructed by the DI container, so constructor parameters get resolved automatically:
+### Sibling lookup
 
 ```csharp
-public class DamageOnTouch : Component
-{
-    private readonly IGameEvents events;
-
-    public DamageOnTouch(IGameEvents events)
-    {
-        this.events = events;
-    }
-
-    protected override void Awake()
-    {
-        Instance.Touched.Connect(other => events.Fire("Touched", other));
-    }
-}
+var hitbox = GetComponent<Hitbox>();          // sibling on the same Instance, or null
+var health = GetRequiredComponent<Health>();  // errors with a clear message if missing
+var maybe  = TryGetComponent<Shield>();       // same as GetComponent; returns null when absent
 ```
 
-`IGameEvents` is resolved from whatever your `GameInstaller` bound it to — same as any other DI-resolved class in the project.
-
-## Lifecycle
-
-| Method | Cadence | Side |
-|---|---|---|
-| `Awake()` | once, on spawn | both |
-| `Start()` | once, deferred to next frame after Awake | both |
-| `Update(float dt)` | every Heartbeat | both |
-| `LateUpdate(float dt)` | every RenderStepped | client only |
-| `OnDestroy()` | once, on tag removal | both |
-
-`Awake` runs before any sibling component's `Start`, so cross-component lookup is safe in `Start` but not `Awake`.
+Safe from `Start` onward (`Awake` order between siblings is undefined). `TryGetComponent` returns `T` rather than Unity's `bool` + `out` shape — out-params don't lower to Luau.
 
 ## SerializedField
 
-Fields and auto-properties marked `[SerializedField]` are persisted as Roblox Instance Attributes under `<ComponentName>_<MemberName>`. They:
+Persisted as Instance Attributes named `<ComponentName>_<Member>`; two-way bound (attribute edits propagate into the live component, code assignments push back). Works on fields and settable auto-properties.
 
-- Show up in Studio's Properties panel under Attributes (and in the Components editor — see below).
-- Survive save/load.
-- Two-way bind: editing the attribute in Studio updates the live value; assigning the field in code pushes back to the attribute.
+Supported: `int` / `long` / `float` / `double` / `string` / `bool`, `Vector3` / `Color3` (stored as native attributes), enums, `Instance` subclasses (stored as a `_uid` GUID attribute, resolved via the runtime registry), `Component` subclasses (stored as the target Instance's GUID, resolved to the live component on each read — so spawn order doesn't matter), plain classes of the above (flattened composites, cycles rejected), and `List<T>` / `T[]` of any of those (stored as `<prefix>_Count` + `<prefix>_1..N`).
 
-Supported types in v1: `int`, `long`, `float`, `double`, `string`, `bool`.
+## Studio inspector
 
-## Studio editor
+`studio-plugin/ComponentEditor.server.luau` — save as a local plugin (drop in `ServerStorage`, right-click → **Save as Local Plugin**). Discovers compiled component definitions by scanning ReplicatedStorage / ServerScriptService / StarterPlayerScripts. Provides:
 
-`studio-plugin/ComponentEditor.server.luau` is a Unity-style inspector that lets you add/remove components on a selected Instance and edit their serialized fields. Save it as a local plugin in Studio:
+- Add / remove components on the selected Instance (attributes initialized / cleaned up)
+- Typed editors: number, string, bool, enum dropdown with search, Instance picker (pick-from-selection + clear), composite foldouts, list add/remove/reorder-on-delete
+- Custom property drawers: a ModuleScript returning `{ DrawerFor = "enum:MoveState", Draw = function(...) end }` overrides built-ins
+- Every edit is a `ChangeHistoryService` recording — Ctrl+Z works
+- Auto-refreshes when a component ModuleScript's Source changes or scripts are added/removed under the discovery roots — recompiling after a `[SerializedField]` edit updates the panel without re-selecting
 
-1. Drop the file somewhere Studio can see it (e.g. `ServerStorage`).
-2. Right-click → **Save as Local Plugin**.
-3. The **Components** toolbar appears in the Plugins tab.
+## Caveats
 
-(Currently the editor only lists Lua-authored definitions in `runtime/Definitions/` — the discovery path for compiled C# components is on the roadmap. For now, add the `Component:<Name>` tag manually via Studio's Tag Editor.)
-
-## How it works (under the hood)
-
-1. The roblox-csharp compiler detects `: Component` subclasses by base-type symbol.
-2. Each component class compiles to a `Component.define(name)` module instead of the regular Luau class scaffold — same metatable + serialized-field plumbing the runtime expects.
-3. The compiler walks every syntax tree when compiling the project's `Installer`, collects every Component subclass, and appends an auto-registration tail to the installer's boot script:
-
-   ```lua
-   _container:Bootstrap()
-   local _componentsService = ComponentsService.new(_container)
-   _componentsService:Register(Health)
-   _componentsService:Register(DamageOnTouch)
-   ```
-
-4. `ComponentsService` (this plugin's runtime) holds the container, wires `CollectionService` watchers per registered type, resolves each component's `__ctorParams` via the container at spawn time, and drives the `Update` / `LateUpdate` ticks.
-
-The compiler-side hook lives in this plugin's `extension/` folder — `ComponentsExtension.cs` (the `IRobloxCSharpExtension` entry point) and `ComponentLowering.cs` (the `Component` subclass detection + `Component.define` lowering). `roblox-csharp`'s `PluginExtensionLoader` compiles those source files in-memory at install time against the transpiler's loaded assemblies, so this plugin owns its transpiler hook end-to-end — no special-casing inside the main compiler.
-
-## Roadmap
-
-- [ ] Editor discovery of C# component classes (currently scans `runtime/Definitions/` only)
-- [ ] Wider `[SerializedField]` type support (Vector3, Color3, Instance reference)
-- [ ] `[RequireComponent(typeof(T))]` for declared dependencies
-- [ ] `ChangeHistoryService` integration in the editor
-- [ ] Multi-Instance editing in the editor
+- List fields read live from attributes, but list *mutations in code* are runtime-only — persist via the inspector or by writing the attributes yourself. Assigning to a list nested inside a composite is unsupported. Nested lists (`List<List<T>>`) are unsupported.
+- Instance refs resolve from Workspace and ReplicatedStorage only.
+- Tag edits made outside the inspector don't refresh it until the selection changes.
 
 ## License
 

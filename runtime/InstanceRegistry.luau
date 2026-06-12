@@ -12,18 +12,36 @@ local InstanceRegistry = {}
 
 local byUid = {}
 local scanned = setmetatable({}, { __mode = "k" })
-
-local function track(inst)
-	local uid = inst:GetAttribute("_uid")
-	if typeof(uid) ~= "string" or uid == "" then return end
-	byUid[uid] = inst
-end
+local watched = setmetatable({}, { __mode = "k" })
 
 local function untrack(inst)
 	local uid = inst:GetAttribute("_uid")
 	if typeof(uid) == "string" and byUid[uid] == inst then
 		byUid[uid] = nil
 	end
+end
+
+-- byUid holds strong refs, so a stale entry pins the destroyed
+-- hierarchy in memory until the next resolve() of that uid. Drop the
+-- entry eagerly when the instance is destroyed or detached (parent ==
+-- nil — same "gone" rule resolve() applies). A detached instance that
+-- re-enters a scanned root is re-tracked by DescendantAdded.
+local function watch(inst)
+	if watched[inst] then return end
+	watched[inst] = true
+	inst.Destroying:Connect(function()
+		untrack(inst)
+	end)
+	inst.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then untrack(inst) end
+	end)
+end
+
+local function track(inst)
+	local uid = inst:GetAttribute("_uid")
+	if typeof(uid) ~= "string" or uid == "" then return end
+	byUid[uid] = inst
+	watch(inst)
 end
 
 -- Assigns a GUID to `inst` if it doesn't already have one, indexes it,
@@ -36,6 +54,7 @@ function InstanceRegistry.bind(inst)
 		inst:SetAttribute("_uid", uid)
 	end
 	byUid[uid] = inst
+	watch(inst)
 	return uid
 end
 

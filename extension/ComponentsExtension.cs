@@ -9,6 +9,7 @@ using RobloxCSharp.Transformer.AST.Expressions;
 using RobloxCSharp.Transformer.AST.Statements;
 using RobloxCSharp.Transformer.Extensibility;
 using RobloxCSharp.Transformer.Factory;
+using RobloxCSharp.Transformer.Symbols;
 
 namespace RobloxCSharp.Extensions.Components
 {
@@ -26,6 +27,7 @@ namespace RobloxCSharp.Extensions.Components
 
 		private const string ComponentsServiceTypeName = "ComponentsService";
 		private const string ComponentsServiceMetadataName = "Components.ComponentsService";
+		private const string SerializedFieldMetadataName = "Components.SerializedFieldAttribute";
 		private const string InstallerTypeName = "Installer";
 		private const string InstallerNamespace = "DependencyInjection";
 		private const string ServerAttributeName = "ServerAttribute";
@@ -33,6 +35,12 @@ namespace RobloxCSharp.Extensions.Components
 
 		private List<INamedTypeSymbol> _componentClasses = new();
 		private INamedTypeSymbol _componentsServiceSymbol;
+		private INamedTypeSymbol _serializedFieldSymbol;
+		private readonly Dictionary<INamedTypeSymbol, NetworkType> _componentContexts =
+			new(SymbolEqualityComparer.Default);
+		private readonly HashSet<INamedTypeSymbol> _registeredComponents =
+			new(SymbolEqualityComparer.Default);
+		private bool _sawInstallerUnit;
 
 		public string Name => "Components";
 
@@ -40,6 +48,10 @@ namespace RobloxCSharp.Extensions.Components
 		{
 			_componentClasses = CollectComponentClasses(compilation);
 			_componentsServiceSymbol = compilation.GetTypeByMetadataName(ComponentsServiceMetadataName);
+			_serializedFieldSymbol = compilation.GetTypeByMetadataName(SerializedFieldMetadataName);
+			_componentContexts.Clear();
+			_registeredComponents.Clear();
+			_sawInstallerUnit = false;
 		}
 
 		public LuaNode TryRewrite(SyntaxNode syntax, TransformerState state)
@@ -56,19 +68,30 @@ namespace RobloxCSharp.Extensions.Components
 			if (_componentClasses.Count == 0) yield break;
 			if (!IsDiInstallerUnit(syntax, state.SemanticModel)) yield break;
 
+			List<INamedTypeSymbol> matched = ComponentsForUnit(syntax, state);
+			if (matched.Count == 0) yield break;
+
 			if (_componentsServiceSymbol is not null) yield return _componentsServiceSymbol;
-			foreach (INamedTypeSymbol cls in _componentClasses) yield return cls;
+			foreach (INamedTypeSymbol cls in matched) yield return cls;
 		}
 
 		public IEnumerable<INamedTypeSymbol> SuppressImports(CompilationUnitSyntax syntax, TransformerState state)
 		{
-			yield break;
+			// [SerializedField] is compile-time metadata only — there is no
+			// runtime/SerializedFieldAttribute.luau, so a would-be import
+			// would require a module that doesn't exist.
+			if (_serializedFieldSymbol is not null) yield return _serializedFieldSymbol;
 		}
 
 		public void OnUnitTransformed(LuaCompilationUnit unit, CompilationUnitSyntax syntax, TransformerState state)
 		{
 			if (_componentClasses.Count == 0) return;
 			if (!IsDiInstallerUnit(syntax, state.SemanticModel)) return;
+
+			_sawInstallerUnit = true;
+
+			List<INamedTypeSymbol> matched = ComponentsForUnit(syntax, state);
+			if (matched.Count == 0) return;
 
 			string componentsServiceVar = state.GenerateTempName("componentsService");
 
@@ -77,8 +100,10 @@ namespace RobloxCSharp.Extensions.Components
 			svcNew.Arguments.Add(LuaFactory.Identifier(InstallerContainerVar));
 			unit.Members.Add(LuaFactory.LocalDeclaration(componentsServiceVar, svcNew));
 
-			foreach (INamedTypeSymbol componentClass in _componentClasses)
+			foreach (INamedTypeSymbol componentClass in matched)
 			{
+				_registeredComponents.Add(componentClass);
+
 				LuaInvocationExpression registerCall = LuaFactory.Invocation(
 					LuaFactory.MemberAccess(
 						LuaFactory.Identifier(componentsServiceVar),
@@ -91,6 +116,40 @@ namespace RobloxCSharp.Extensions.Components
 
 		public void EmitArtifacts(string outDir, IReadOnlyList<Plugin> plugins, RojoResolver resolver, DiagnosticBag diagnostics)
 		{
+			if (_componentClasses.Count == 0) return;
+
+			List<INamedTypeSymbol> missed = _componentClasses
+				.Where(cls => !_registeredComponents.Contains(cls))
+				.ToList();
+			if (missed.Count == 0) return;
+
+			string names = string.Join(", ", missed.Select(cls => cls.Name));
+			string message = _sawInstallerUnit
+				? $"Component class(es) {names} were not auto-registered: no [Server]/[Client] DI Installer matches their context, so they will never spawn."
+				: $"Component class(es) {names} exist but no [Server]/[Client] DI Installer was found — nothing registers them, so they will never spawn.";
+
+			if (missed[0].DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is SyntaxNode node)
+			{
+				diagnostics.ReportSemanticsDivergence(node, message);
+			}
+		}
+
+		// Components that belong in this installer unit's registration
+		// tail: same Rojo context as the component's own module, with
+		// shared components going server-side. See ComponentContexts.
+		private List<INamedTypeSymbol> ComponentsForUnit(CompilationUnitSyntax syntax, TransformerState state)
+		{
+			NetworkType unitContext = ComponentContexts.OfUnit(syntax, state);
+			List<INamedTypeSymbol> matched = new();
+			foreach (INamedTypeSymbol cls in _componentClasses)
+			{
+				NetworkType componentContext = ComponentContexts.OfComponent(cls, state, _componentContexts);
+				if (ComponentContexts.ShouldRegister(componentContext, unitContext))
+				{
+					matched.Add(cls);
+				}
+			}
+			return matched;
 		}
 
 		private static bool IsDiInstallerUnit(CompilationUnitSyntax syntax, SemanticModel semanticModel)

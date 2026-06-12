@@ -86,6 +86,40 @@ public class Health : Component
 		}
 
 		[Fact]
+		public void Lower_NonSerializedInstanceField_InitializesInConstructor()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+public class Health : Component
+{
+	private double timer = 5.0;
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root);
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("function Health:constructor", rendered);
+			Assert.Contains("self.timer = 5", rendered);
+		}
+
+		[Fact]
+		public void Lower_CtorParams_NonInjectableParam_EmitsFalsePlaceholder()
+		{
+			(var state, var root, _) = TestHarness.Compile(@"
+using Components;
+using DependencyInjection;
+public class Health : Component
+{
+	public Health(Container container, int amount) { }
+}");
+			ClassDeclarationSyntax cls = TestHarness.FirstNode<ClassDeclarationSyntax>(root);
+
+			string rendered = new LuaRenderer().Render(ComponentLowering.Lower(state, cls));
+
+			Assert.Contains("__ctorParams = {Container, false}", rendered);
+		}
+
+		[Fact]
 		public void Lower_SerializedField_UnsupportedType_Throws()
 		{
 			(var state, var root, _) = TestHarness.Compile(@"

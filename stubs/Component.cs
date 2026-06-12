@@ -17,12 +17,8 @@ namespace Components
         /// <summary>Returns the sibling component of type <typeparamref name="T"/>; throws if absent.</summary>
         public T GetRequiredComponent<T>() where T : Component => default;
 
-        /// <summary>Try-pattern variant of <see cref="GetComponent{T}"/>.</summary>
-        public bool TryGetComponent<T>(out T component) where T : Component
-        {
-            component = default;
-            return default;
-        }
+        /// <summary>Nil-safe variant of <see cref="GetRequiredComponent{T}"/> — returns the sibling component or <c>null</c>. (Unity's out-param shape doesn't lower to Luau.)</summary>
+        public T TryGetComponent<T>() where T : Component => default;
 
         /// <summary>Runs once on spawn, before any sibling component's <see cref="Start"/>. <see cref="Instance"/> is set.</summary>
         protected virtual void Awake() { }

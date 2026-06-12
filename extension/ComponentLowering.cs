@@ -69,40 +69,10 @@ namespace RobloxCSharp.Extensions.Components
 			ConstructorDeclarationSyntax userCtor = FindUserConstructor(syntax);
 			body.Add(BuildCtorParams(state, className, userCtor));
 
-			foreach (MemberDeclarationSyntax member in syntax.Members)
-			{
-				switch (member)
-				{
-					case MethodDeclarationSyntax method:
-						body.Add(state.Transform(method));
-						break;
-					case ConstructorDeclarationSyntax ctorSyntax:
-						LuaConstructorDeclaration luaCtor =
-							(LuaConstructorDeclaration)state.Transform(ctorSyntax);
-						luaCtor.BaseCall = null;
-						body.Add(luaCtor);
-						break;
-					case FieldDeclarationSyntax field when IsStaticOrConst(field):
-						body.Add(state.Transform(field));
-						break;
-				}
-			}
+			MemberLowering.EmitMembers(state, syntax, className, body);
 
 			declaration.Members.Add(LuaFactory.Block(warpInDoEnd: true, body));
 			return declaration;
-		}
-
-		private static bool IsStaticOrConst(FieldDeclarationSyntax field)
-		{
-			foreach (SyntaxToken modifier in field.Modifiers)
-			{
-				if (modifier.IsKind(SyntaxKind.StaticKeyword)
-					|| modifier.IsKind(SyntaxKind.ConstKeyword))
-				{
-					return true;
-				}
-			}
-			return false;
 		}
 
 		private static ConstructorDeclarationSyntax FindUserConstructor(ClassDeclarationSyntax syntax)
@@ -121,14 +91,12 @@ namespace RobloxCSharp.Extensions.Components
 			{
 				foreach (ParameterSyntax param in ctor.ParameterList.Parameters)
 				{
-					if (param.Type is null) continue;
-					if (state.SemanticModel.GetTypeInfo(param.Type).Type is not INamedTypeSymbol named) continue;
-					if (named.SpecialType != SpecialType.None) continue;
-					if (named.TypeKind is not (TypeKind.Class or TypeKind.Interface)) continue;
-
-					table.Elements.Add(named.TypeKind == TypeKind.Interface
-						? (LuaNode)LuaFactory.LiteralExpression(named.Name)
-						: LuaFactory.Identifier(named.Name));
+					// Params the container can't inject (primitives,
+					// unresolvable types) still get an entry — `false` —
+					// so the runtime's positional arg-building loop stays
+					// aligned with the ctor's arity. ComponentsService
+					// passes nil for those slots.
+					table.Elements.Add(BuildCtorParamEntry(state, param));
 				}
 			}
 
@@ -136,6 +104,20 @@ namespace RobloxCSharp.Extensions.Components
 				LuaFactory.Assignment(SyntaxKind.SimpleAssignmentExpression,
 					LuaFactory.MemberAccess(className, "__ctorParams"),
 					table));
+		}
+
+		private static LuaNode BuildCtorParamEntry(TransformerState state, ParameterSyntax param)
+		{
+			if (param.Type is null) return LuaFactory.LiteralExpression(false);
+			if (state.SemanticModel.GetTypeInfo(param.Type).Type is not INamedTypeSymbol named)
+				return LuaFactory.LiteralExpression(false);
+			if (named.SpecialType != SpecialType.None) return LuaFactory.LiteralExpression(false);
+			if (named.TypeKind is not (TypeKind.Class or TypeKind.Interface))
+				return LuaFactory.LiteralExpression(false);
+
+			return named.TypeKind == TypeKind.Interface
+				? (LuaNode)LuaFactory.LiteralExpression(named.Name)
+				: LuaFactory.Identifier(named.Name);
 		}
 
 		private static LuaTableExpression BuildSerializedFieldsTable(TransformerState state, ClassDeclarationSyntax syntax)
@@ -252,7 +234,7 @@ namespace RobloxCSharp.Extensions.Components
 				value));
 		}
 
-		private static bool HasSerializedFieldAttribute(SyntaxList<AttributeListSyntax> attributeLists)
+		internal static bool HasSerializedFieldAttribute(SyntaxList<AttributeListSyntax> attributeLists)
 		{
 			foreach (AttributeListSyntax al in attributeLists)
 			{

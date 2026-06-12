@@ -16,9 +16,19 @@ local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
 
 local Component = require(script.Parent.Component)
 local InstanceRegistry = require(script.Parent.InstanceRegistry)
+
+-- Tagged instances under ServerStorage / ReplicatedStorage are
+-- templates (prefabs waiting to be cloned) — they must not tick.
+-- CollectionService tags clone with the instance, so a clone parented
+-- into Workspace fires GetInstanceAddedSignal and spawns normally.
+local function isStorageTemplate(instance)
+	return instance:IsDescendantOf(ServerStorage)
+		or instance:IsDescendantOf(ReplicatedStorage)
+end
 
 local ComponentsService = setmetatable({}, {
 	__tostring = function() return "ComponentsService" end,
@@ -86,17 +96,44 @@ function ComponentsService:Register(definition)
 	local tag = Component.tagFor(definition.ComponentName)
 
 	for _, existing in ipairs(CollectionService:GetTagged(tag)) do
-		self:_spawn(definition, existing)
+		self:_trySpawn(definition, existing)
 	end
 
 	table.insert(self._connections,
 		CollectionService:GetInstanceAddedSignal(tag):Connect(function(instance)
-			self:_spawn(definition, instance)
+			self:_trySpawn(definition, instance)
 		end))
 	table.insert(self._connections,
 		CollectionService:GetInstanceRemovedSignal(tag):Connect(function(instance)
 			self:_destroy(definition, instance)
 		end))
+end
+
+-- Spawn gate for storage templates. A tagged prefab still inside
+-- ServerStorage / ReplicatedStorage doesn't spawn; instead we watch
+-- its ancestry so a straight reparent into the live DataModel (which
+-- does NOT re-fire the tag-added signal) still spawns it.
+function ComponentsService:_trySpawn(definition, instance)
+	if not isStorageTemplate(instance) then
+		self:_spawn(definition, instance)
+		return
+	end
+
+	local tag = Component.tagFor(definition.ComponentName)
+	local conn
+	conn = instance.AncestryChanged:Connect(function()
+		if instance.Parent == nil then
+			conn:Disconnect()
+		elseif not isStorageTemplate(instance) then
+			conn:Disconnect()
+			-- The tag could have been stripped while the template sat in
+			-- storage — only the tag's presence makes this a component.
+			if CollectionService:HasTag(instance, tag) then
+				self:_spawn(definition, instance)
+			end
+		end
+	end)
+	table.insert(self._connections, conn)
 end
 
 -- Creates the live component for `instance`, runs the DI constructor
@@ -113,10 +150,15 @@ function ComponentsService:_spawn(definition, instance)
 	-- Resolve __ctorParams via the container. Empty for parameterless
 	-- components; populated for DI-injected ones. Container:Resolve
 	-- handles cycles + missing-binding diagnostics on its own, so we
-	-- don't shadow them here.
-	local args = {}
-	for i, paramType in ipairs(definition.__ctorParams or {}) do
-		args[i] = self._container:Resolve(paramType)
+	-- don't shadow them here. `false` is the lowering's placeholder for
+	-- a param DI can't inject (primitives, unresolved types) — the slot
+	-- stays so later params keep their positions; the ctor sees nil.
+	local params = definition.__ctorParams or {}
+	local args = table.create(#params)
+	for i, paramType in ipairs(params) do
+		if paramType ~= false then
+			args[i] = self._container:Resolve(paramType)
+		end
 	end
 
 	-- Component.spawn produces the table with attribute-backed
@@ -125,9 +167,14 @@ function ComponentsService:_spawn(definition, instance)
 	local component = Component.spawn(definition, instance)
 
 	if definition.constructor then
-		local ok, err = pcall(definition.constructor, component, table.unpack(args))
+		local ok, err = pcall(definition.constructor, component, table.unpack(args, 1, #params))
 		if not ok then
 			warn(string.format("[Components] %s constructor errored: %s", componentName, err))
+			-- Same teardown as a tag removal: Component.spawn already
+			-- wired attribute connections and indexed the component;
+			-- without this they'd leak, since the component never
+			-- enters _active and the regular destroy path can't reach it.
+			Component.destroy(component)
 			return
 		end
 	end
